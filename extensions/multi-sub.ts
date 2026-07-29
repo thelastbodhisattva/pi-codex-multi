@@ -1,7 +1,7 @@
 /**
  * Multi-Subscription extension for pi.
  *
- * Register additional OAuth subscription accounts for any supported provider.
+ * Register additional ChatGPT Plus/Pro accounts through OpenAI Codex OAuth.
  * Each extra account gets its own provider name, /login entry, and cloned models.
  *
  * Features:
@@ -24,12 +24,8 @@
  *   - Restrict which subscriptions are usable via "allowedSubs"
  *   - Leave pools empty to inherit global pools
  *
- * Supported providers:
- *   - anthropic          (Claude Pro/Max)
- *   - openai-codex       (ChatGPT Plus/Pro Codex)
- *   - github-copilot     (GitHub Copilot)
- *   - google-gemini-cli  (Google Cloud Code Assist)
- *   - google-antigravity (Antigravity)
+ * Supported provider:
+ *   - openai-codex (ChatGPT Plus/Pro Codex)
  */
 
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
@@ -45,30 +41,12 @@ import {
 	DynamicBorder,
 	getAgentDir,
 	keyHint,
+	readStoredCredential,
 } from "@earendil-works/pi-coding-agent";
-import {
-	anthropicOAuthProvider,
-	loginAnthropic,
-	refreshAnthropicToken,
-	openaiCodexOAuthProvider,
-	loginOpenAICodex,
-	refreshOpenAICodexToken,
-	githubCopilotOAuthProvider,
-	loginGitHubCopilot,
-	refreshGitHubCopilotToken,
-	getGitHubCopilotBaseUrl,
-	normalizeDomain,
-	geminiCliOAuthProvider,
-	loginGeminiCli,
-	refreshGoogleCloudToken,
-	antigravityOAuthProvider,
-	loginAntigravity,
-	refreshAntigravityToken,
-	type OAuthCredentials,
-	type OAuthLoginCallbacks,
-	type OAuthProviderInterface,
-} from "@earendil-works/pi-ai/oauth";
-import { getModels, type Api, type Model } from "@earendil-works/pi-ai";
+import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai/oauth";
+import type { Api, Model } from "@earendil-works/pi-ai";
+import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
+import { createOAuthInteraction, toOAuthCredential } from "../src/oauth-compat.mts";
 import {
 	Container,
 	Key,
@@ -78,161 +56,67 @@ import {
 	type SelectItem,
 } from "@earendil-works/pi-tui";
 
+function getAuthStorage(ctx: {
+	modelRegistry: { getProviderAuthStatus(provider: string): { configured: boolean } };
+}): {
+	hasAuth(provider: string): boolean;
+	get(provider: string): Record<string, unknown> | undefined;
+	logout(provider: string): void;
+} {
+	return {
+		hasAuth: (provider) => ctx.modelRegistry.getProviderAuthStatus(provider).configured,
+		get: (provider) => readStoredCredential(provider) as Record<string, unknown> | undefined,
+		logout(provider) {
+			try {
+				const authPath = join(getAgentDir(), "auth.json");
+				const data = JSON.parse(readFileSync(authPath, "utf-8")) as Record<string, unknown>;
+				if (!data[provider]) return;
+				delete data[provider];
+				writeFileSync(authPath, `${JSON.stringify(data, null, 2)}\n`, "utf-8");
+			} catch {
+				// Missing or unreadable auth storage means there is nothing to log out.
+			}
+		},
+	};
+}
+
 // ==========================================================================
 // Provider templates
 // ==========================================================================
 
-type CopilotCredentials = OAuthCredentials & { enterpriseUrl?: string };
-type GeminiCredentials = OAuthCredentials & { projectId?: string };
+const openaiCodexProvider = builtinProviders().find(({ id }) => id === "openai-codex");
+const openaiCodexOAuth = openaiCodexProvider?.auth.oauth;
+if (!openaiCodexProvider || !openaiCodexOAuth) {
+	throw new Error("pi-codex-multi: the installed pi-ai OpenAI Codex provider has no OAuth flow");
+}
+
+function getCodexModels(): Model<Api>[] {
+	return [...openaiCodexProvider.getModels()] as Model<Api>[];
+}
+
+type RegisteredProviderConfig = Parameters<ExtensionAPI["registerProvider"]>[1];
+type LegacyOAuthProvider = NonNullable<RegisteredProviderConfig["oauth"]>;
 
 interface ProviderTemplate {
 	displayName: string;
-	builtinOAuth: OAuthProviderInterface;
-	usesCallbackServer?: boolean;
-	buildOAuth(index: number): Omit<OAuthProviderInterface, "id">;
-	buildModifyModels?(providerName: string): OAuthProviderInterface["modifyModels"];
+	buildOAuth(index: number): LegacyOAuthProvider;
 }
 
 const PROVIDER_TEMPLATES: Record<string, ProviderTemplate> = {
-	anthropic: {
-		displayName: "Anthropic (Claude Pro/Max)",
-		builtinOAuth: anthropicOAuthProvider,
-		buildOAuth(index: number) {
-			return {
-				name: `Anthropic #${index}`,
-				async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
-					return loginAnthropic({
-						onAuth: callbacks.onAuth,
-						onPrompt: callbacks.onPrompt,
-						onProgress: callbacks.onProgress,
-						onManualCodeInput: callbacks.onManualCodeInput,
-					});
-				},
-				async refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
-					return refreshAnthropicToken(credentials.refresh);
-				},
-				getApiKey(credentials: OAuthCredentials): string {
-					return credentials.access;
-				},
-			};
-		},
-	},
-
 	"openai-codex": {
 		displayName: "ChatGPT Plus/Pro (Codex)",
-		builtinOAuth: openaiCodexOAuthProvider,
-		usesCallbackServer: true,
 		buildOAuth(index: number) {
 			return {
 				name: `ChatGPT Codex #${index}`,
 				usesCallbackServer: true,
 				async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
-					return loginOpenAICodex({
-						onAuth: callbacks.onAuth,
-						onPrompt: callbacks.onPrompt,
-						onProgress: callbacks.onProgress,
-						onManualCodeInput: callbacks.onManualCodeInput,
-					});
+					return openaiCodexOAuth.login(createOAuthInteraction(callbacks));
 				},
 				async refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
-					return refreshOpenAICodexToken(credentials.refresh);
+					return openaiCodexOAuth.refresh(toOAuthCredential(credentials));
 				},
 				getApiKey(credentials: OAuthCredentials): string {
 					return credentials.access;
-				},
-			};
-		},
-	},
-
-	"github-copilot": {
-		displayName: "GitHub Copilot",
-		builtinOAuth: githubCopilotOAuthProvider,
-		buildOAuth(index: number) {
-			return {
-				name: `GitHub Copilot #${index}`,
-				async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
-					return loginGitHubCopilot({
-						onAuth: (url: string, instructions?: string) =>
-							callbacks.onAuth({ url, instructions }),
-						onPrompt: callbacks.onPrompt,
-						onProgress: callbacks.onProgress,
-						signal: callbacks.signal,
-					});
-				},
-				async refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
-					const creds = credentials as CopilotCredentials;
-					return refreshGitHubCopilotToken(creds.refresh, creds.enterpriseUrl);
-				},
-				getApiKey(credentials: OAuthCredentials): string {
-					return credentials.access;
-				},
-			};
-		},
-		buildModifyModels(providerName: string) {
-			return (models: Model<Api>[], credentials: OAuthCredentials): Model<Api>[] => {
-				const creds = credentials as CopilotCredentials;
-				const domain = creds.enterpriseUrl
-					? (normalizeDomain(creds.enterpriseUrl) ?? undefined)
-					: undefined;
-				const baseUrl = getGitHubCopilotBaseUrl(creds.access, domain);
-				return models.map((m) =>
-					m.provider === providerName ? { ...m, baseUrl } : m,
-				);
-			};
-		},
-	},
-
-	"google-gemini-cli": {
-		displayName: "Google Cloud Code Assist",
-		builtinOAuth: geminiCliOAuthProvider,
-		usesCallbackServer: true,
-		buildOAuth(index: number) {
-			return {
-				name: `Google Cloud Code Assist #${index}`,
-				usesCallbackServer: true,
-				async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
-					return loginGeminiCli(
-						callbacks.onAuth,
-						callbacks.onProgress,
-						callbacks.onManualCodeInput,
-					);
-				},
-				async refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
-					const creds = credentials as GeminiCredentials;
-					if (!creds.projectId) throw new Error("Missing projectId");
-					return refreshGoogleCloudToken(creds.refresh, creds.projectId);
-				},
-				getApiKey(credentials: OAuthCredentials): string {
-					const creds = credentials as GeminiCredentials;
-					return JSON.stringify({ token: creds.access, projectId: creds.projectId });
-				},
-			};
-		},
-	},
-
-	"google-antigravity": {
-		displayName: "Antigravity",
-		builtinOAuth: antigravityOAuthProvider,
-		usesCallbackServer: true,
-		buildOAuth(index: number) {
-			return {
-				name: `Antigravity #${index}`,
-				usesCallbackServer: true,
-				async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
-					return loginAntigravity(
-						callbacks.onAuth,
-						callbacks.onProgress,
-						callbacks.onManualCodeInput,
-					);
-				},
-				async refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
-					const creds = credentials as GeminiCredentials;
-					if (!creds.projectId) throw new Error("Missing projectId");
-					return refreshAntigravityToken(creds.refresh, creds.projectId);
-				},
-				getApiKey(credentials: OAuthCredentials): string {
-					const creds = credentials as GeminiCredentials;
-					return JSON.stringify({ token: creds.access, projectId: creds.projectId });
 				},
 			};
 		},
@@ -246,25 +130,6 @@ const SUPPORTED_PROVIDERS = Object.keys(PROVIDER_TEMPLATES);
 // ==========================================================================
 
 const DEFAULT_CODEX_USAGE_BASE_URL = "https://chatgpt.com/backend-api";
-const GOOGLE_GEMINI_QUOTA_ENDPOINT = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota";
-const GOOGLE_ANTIGRAVITY_QUOTA_ENDPOINTS = [
-	"https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:fetchAvailableModels",
-	"https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
-] as const;
-const GOOGLE_GEMINI_HEADERS = {
-	"User-Agent": "google-api-nodejs-client/9.15.1",
-	"X-Goog-Api-Client": "gl-node/22.17.0",
-};
-const GOOGLE_ANTIGRAVITY_HEADERS = {
-	"User-Agent": "antigravity/1.11.9 windows/amd64",
-	"X-Goog-Api-Client": "google-cloud-sdk vscode_cloudshelleditor/0.1",
-	"Client-Metadata": JSON.stringify({
-		ideType: "IDE_UNSPECIFIED",
-		platform: "PLATFORM_UNSPECIFIED",
-		pluginType: "GEMINI",
-	}),
-};
-const GOOGLE_ANTIGRAVITY_HIDDEN_MODELS = new Set(["tab_flash_lite_preview"]);
 const OPENAI_AUTH_CLAIM = "https://api.openai.com/auth";
 const OPENAI_PROFILE_CLAIM = "https://api.openai.com/profile";
 
@@ -311,42 +176,6 @@ interface CodexUsageSnapshot {
 	email: string;
 	fiveHour?: CodexUsageWindow;
 	weekly?: CodexUsageWindow;
-}
-
-interface GoogleGeminiQuotaResponse {
-	buckets?: Array<{
-		modelId?: string;
-		remainingFraction?: number;
-		resetTime?: string;
-	}>;
-}
-
-interface GoogleAntigravityQuotaResponse {
-	models?: Record<
-		string,
-		{
-			displayName?: string;
-			model?: string;
-			isInternal?: boolean;
-			quotaInfo?: {
-				remainingFraction?: number;
-				resetTime?: string;
-			};
-		}
-	>;
-}
-
-interface GoogleQuotaModelSnapshot {
-	model: string;
-	remainingPercent?: number;
-	resetAt?: number;
-}
-
-interface GoogleQuotaAccountSnapshot {
-	endpoint: string;
-	projectId?: string;
-	models: GoogleQuotaModelSnapshot[];
-	worstRemainingPercent?: number;
 }
 
 function decodeJwtPayload(token: string): Record<string, unknown> {
@@ -808,390 +637,6 @@ async function selectQuotaResult(
 	return results.find((result) => result.account.providerName === selectedProviderName);
 }
 
-function normalizeGoogleRemainingPercent(value: unknown): number | undefined {
-	if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
-	return Math.max(0, Math.min(100, Math.round(value * 100)));
-}
-
-function getGoogleProjectId(account: QuotaAccount, auth: AuthStorageEntry): string | undefined {
-	if (typeof auth.projectId === "string" && auth.projectId.length > 0) {
-		return auth.projectId;
-	}
-
-	if (account.baseProvider === "google-antigravity") {
-		const projectId = process.env.GOOGLE_ANTIGRAVITY_PROJECT_ID || process.env.GOOGLE_ANTIGRAVITY_PROJECT;
-		if (projectId) return projectId;
-	}
-
-	const projectId = process.env.GOOGLE_CLOUD_PROJECT || process.env.GOOGLE_CLOUD_PROJECT_ID;
-	return projectId || undefined;
-}
-
-function updateGoogleQuotaModel(
-	modelsByName: Map<string, GoogleQuotaModelSnapshot>,
-	model: string,
-	remainingPercent: number | undefined,
-	resetAt: number | undefined,
-): void {
-	const existing = modelsByName.get(model);
-	if (!existing) {
-		modelsByName.set(model, { model, remainingPercent, resetAt });
-		return;
-	}
-
-	let next = existing;
-	if (remainingPercent !== undefined) {
-		if (existing.remainingPercent === undefined || remainingPercent < existing.remainingPercent) {
-			next = { ...next, remainingPercent };
-		}
-	}
-	if (resetAt !== undefined) {
-		if (next.resetAt === undefined || resetAt < next.resetAt) {
-			next = { ...next, resetAt };
-		}
-	}
-	if (next !== existing) {
-		modelsByName.set(model, next);
-	}
-}
-
-function buildGoogleQuotaSnapshot(
-	endpoint: string,
-	projectId: string | undefined,
-	modelsByName: Map<string, GoogleQuotaModelSnapshot>,
-): GoogleQuotaAccountSnapshot {
-	const models = [...modelsByName.values()];
-	const remainingPercents = models
-		.map((model) => model.remainingPercent)
-		.filter((value): value is number => value !== undefined);
-	const worstRemainingPercent = remainingPercents.length > 0
-		? Math.min(...remainingPercents)
-		: undefined;
-
-	return {
-		endpoint,
-		projectId,
-		models,
-		worstRemainingPercent,
-	};
-}
-
-function getGoogleGeminiModelLabel(modelId: string | undefined): string {
-	if (!modelId) return "unknown";
-	const normalized = modelId.toLowerCase();
-	if (normalized.includes("pro")) return "Pro";
-	if (normalized.includes("flash")) return "Flash";
-	return modelId;
-}
-
-function parseGoogleGeminiQuotaSnapshot(
-	data: unknown,
-	projectId: string | undefined,
-): GoogleQuotaAccountSnapshot {
-	const raw = getRecord(data) as GoogleGeminiQuotaResponse | undefined;
-	const buckets = Array.isArray(raw?.buckets) ? raw.buckets : [];
-	const modelsByName = new Map<string, GoogleQuotaModelSnapshot>();
-
-	for (const bucketValue of buckets) {
-		const bucket = getRecord(bucketValue);
-		const model = getGoogleGeminiModelLabel(
-			typeof bucket?.modelId === "string" ? bucket.modelId : undefined,
-		);
-		const remainingPercent = normalizeGoogleRemainingPercent(bucket?.remainingFraction);
-		const resetAt = typeof bucket?.resetTime === "string"
-			? parseIsoTimestampSeconds(bucket.resetTime)
-			: undefined;
-		if (remainingPercent === undefined && resetAt === undefined) continue;
-		updateGoogleQuotaModel(modelsByName, model, remainingPercent, resetAt);
-	}
-
-	return buildGoogleQuotaSnapshot(GOOGLE_GEMINI_QUOTA_ENDPOINT, projectId, modelsByName);
-}
-
-function parseGoogleAntigravityQuotaSnapshot(
-	data: unknown,
-	endpoint: string,
-	projectId: string | undefined,
-): GoogleQuotaAccountSnapshot {
-	const raw = getRecord(data) as GoogleAntigravityQuotaResponse | undefined;
-	const rawModels = getRecord(raw?.models);
-	const modelsByName = new Map<string, GoogleQuotaModelSnapshot>();
-
-	if (rawModels) {
-		for (const [modelKey, modelValue] of Object.entries(rawModels)) {
-			const model = getRecord(modelValue);
-			if (model?.isInternal === true) continue;
-			if (GOOGLE_ANTIGRAVITY_HIDDEN_MODELS.has(modelKey.toLowerCase())) continue;
-			const displayName = typeof model?.displayName === "string" && model.displayName.length > 0
-				? model.displayName
-				: typeof model?.model === "string" && model.model.length > 0
-					? model.model
-					: modelKey;
-			if (GOOGLE_ANTIGRAVITY_HIDDEN_MODELS.has(displayName.toLowerCase())) continue;
-			const quotaInfo = getRecord(model?.quotaInfo);
-			const remainingPercent = normalizeGoogleRemainingPercent(quotaInfo?.remainingFraction);
-			const resetAt = typeof quotaInfo?.resetTime === "string"
-				? parseIsoTimestampSeconds(quotaInfo.resetTime)
-				: undefined;
-			if (remainingPercent === undefined && resetAt === undefined) continue;
-			updateGoogleQuotaModel(modelsByName, displayName, remainingPercent, resetAt);
-		}
-	}
-
-	return buildGoogleQuotaSnapshot(endpoint, projectId, modelsByName);
-}
-
-function classifyGoogleQuotaKind(snapshot: GoogleQuotaAccountSnapshot): {
-	kind: QuotaStatusKind;
-	score: number;
-} {
-	const bottleneck = snapshot.worstRemainingPercent;
-	if (bottleneck === undefined) {
-		return { kind: "error", score: 0 };
-	}
-	if (bottleneck <= 5) return { kind: "blocked", score: bottleneck };
-	if (bottleneck <= 15) return { kind: "low", score: bottleneck };
-	if (bottleneck <= 30) return { kind: "watch", score: bottleneck };
-	return { kind: "ready", score: bottleneck };
-}
-
-async function resolveGoogleQuotaAccess(
-	account: QuotaAccount,
-	auth: AuthStorageEntry,
-): Promise<{ accessToken: string; projectId?: string }> {
-	const projectId = getGoogleProjectId(account, auth);
-	const hasFreshAccess = typeof auth.access === "string"
-		&& auth.access.length > 0
-		&& (typeof auth.expires !== "number" || auth.expires > Date.now() + 60_000);
-	if (hasFreshAccess) {
-		return { accessToken: auth.access, projectId };
-	}
-
-	if (typeof auth.refresh === "string" && auth.refresh.length > 0) {
-		const credentials = account.baseProvider === "google-gemini-cli"
-			? await refreshGoogleCloudToken(auth.refresh, projectId || "") as Promise<GeminiCredentials>
-			: await refreshAntigravityToken(auth.refresh, projectId || "") as Promise<GeminiCredentials>;
-		return {
-			accessToken: credentials.access,
-			projectId: typeof credentials.projectId === "string" && credentials.projectId.length > 0
-				? credentials.projectId
-				: projectId,
-		};
-	}
-
-	if (typeof auth.access === "string" && auth.access.length > 0) {
-		return { accessToken: auth.access, projectId };
-	}
-
-	throw new Error("Missing Google access token. Log in again.");
-}
-
-async function fetchGoogleGeminiQuotaSnapshot(
-	accessToken: string,
-	projectId: string | undefined,
-	signal?: AbortSignal,
-): Promise<GoogleQuotaAccountSnapshot> {
-	const response = await fetch(GOOGLE_GEMINI_QUOTA_ENDPOINT, {
-		method: "POST",
-		headers: {
-			Authorization: `Bearer ${accessToken}`,
-			Accept: "application/json",
-			"Content-Type": "application/json",
-			...GOOGLE_GEMINI_HEADERS,
-		},
-		body: "{}",
-		signal,
-	});
-	if (!response.ok) {
-		throw new Error(await readResponseError(response));
-	}
-	return parseGoogleGeminiQuotaSnapshot(await response.json(), projectId);
-}
-
-async function fetchGoogleAntigravityQuotaSnapshot(
-	accessToken: string,
-	projectId: string | undefined,
-	signal?: AbortSignal,
-): Promise<GoogleQuotaAccountSnapshot> {
-	let lastError = "Google quota lookup failed";
-
-	for (const endpoint of GOOGLE_ANTIGRAVITY_QUOTA_ENDPOINTS) {
-		const response = await fetch(endpoint, {
-			method: "POST",
-			headers: {
-				Authorization: `Bearer ${accessToken}`,
-				Accept: "application/json",
-				"Content-Type": "application/json",
-				...GOOGLE_ANTIGRAVITY_HEADERS,
-			},
-			body: JSON.stringify(projectId ? { project: projectId } : {}),
-			signal,
-		});
-		if (response.ok) {
-			return parseGoogleAntigravityQuotaSnapshot(await response.json(), endpoint, projectId);
-		}
-		lastError = await readResponseError(response);
-	}
-
-	throw new Error(lastError);
-}
-
-function getGoogleQuotaBucketLabel(account: QuotaAccount, count: number): string {
-	if (account.baseProvider === "google-gemini-cli") {
-		return `${count} ${count === 1 ? "family" : "families"}`;
-	}
-	return `${count} ${count === 1 ? "model" : "models"}`;
-}
-
-function buildGoogleQuotaErrorDetails(
-	account: QuotaAccount,
-	message: string,
-	projectId?: string,
-): string[] {
-	const details = [
-		`account: ${account.displayName}`,
-		`provider: ${account.providerName}`,
-		"status: error",
-	];
-	if (projectId) {
-		details.push(`project: ${projectId}`);
-	}
-	details.push(`details: ${message}`);
-
-	if (/401|unauthorized/i.test(message)) {
-		details.push("login: use /subs login or /login to authenticate this account again");
-		return details;
-	}
-
-	if (/403|permission/i.test(message)) {
-		if (account.baseProvider === "google-gemini-cli") {
-			details.push(
-				"hint: Google Cloud Code Assist rejected quota access for this account; try /subs login again and verify this account still has Gemini quota access",
-			);
-		} else {
-			details.push(
-				"hint: Google rejected this Antigravity quota request; verify the saved project/account pairing is still valid and try /subs login again",
-			);
-		}
-	}
-
-	return details;
-}
-
-function formatGoogleQuotaDetails(
-	account: QuotaAccount,
-	snapshot: GoogleQuotaAccountSnapshot,
-	kind: QuotaStatusKind,
-): string[] {
-	const details = [
-		`account: ${account.displayName}`,
-		`provider: ${account.providerName}`,
-		`status: ${formatQuotaKind(kind)}`,
-	];
-	if (snapshot.projectId) {
-		details.push(`project: ${snapshot.projectId}`);
-	}
-	if (snapshot.worstRemainingPercent !== undefined) {
-		details.push(`bottleneck: ${formatRemainingPercent(snapshot.worstRemainingPercent)} left`);
-	}
-	for (const model of [...snapshot.models].sort((left, right) => {
-		const leftPercent = left.remainingPercent ?? 101;
-		const rightPercent = right.remainingPercent ?? 101;
-		return leftPercent - rightPercent || left.model.localeCompare(right.model);
-	})) {
-		details.push(
-			`${model.model}: ${formatRemainingPercent(model.remainingPercent)} left, resets ${formatResetLong(model.resetAt)}`,
-		);
-	}
-	details.push(`endpoint: ${snapshot.endpoint}`);
-	return details;
-}
-
-async function checkGoogleQuotaAccount(
-	account: QuotaAccount,
-	fetchSnapshot: (
-		accessToken: string,
-		projectId: string | undefined,
-		signal?: AbortSignal,
-	) => Promise<GoogleQuotaAccountSnapshot>,
-	signal?: AbortSignal,
-): Promise<QuotaCheckResult> {
-	const auth = account.auth;
-	if (!auth || auth.type !== "oauth") {
-		return {
-			account,
-			kind: "missing-auth",
-			summary: "not logged in",
-			details: [
-				`account: ${account.displayName}`,
-				`provider: ${account.providerName}`,
-				"status: not logged in",
-				"login: use /subs login or /login to authenticate this account",
-			],
-			score: 0,
-		};
-	}
-	if ((typeof auth.access !== "string" || auth.access.length === 0)
-		&& (typeof auth.refresh !== "string" || auth.refresh.length === 0)) {
-		return {
-			account,
-			kind: "missing-auth",
-			summary: "missing Google tokens",
-			details: [
-				`account: ${account.displayName}`,
-				`provider: ${account.providerName}`,
-				"status: not logged in",
-				"details: saved Google credentials are missing both access and refresh tokens",
-				"login: use /subs login or /login to authenticate this account again",
-			],
-			score: 0,
-		};
-	}
-
-	let projectId: string | undefined;
-
-	try {
-		const credentials = await resolveGoogleQuotaAccess(account, auth);
-		projectId = credentials.projectId;
-		const snapshot = await fetchSnapshot(credentials.accessToken, credentials.projectId, signal);
-		if (snapshot.models.length === 0 || snapshot.worstRemainingPercent === undefined) {
-			return {
-				account,
-				kind: "error",
-				summary: "no model quota data returned",
-				details: [
-					`account: ${account.displayName}`,
-					`provider: ${account.providerName}`,
-					"status: error",
-					...(projectId ? [`project: ${projectId}`] : []),
-					"details: Google returned no usable model quota data",
-					`endpoint: ${snapshot.endpoint}`,
-				],
-				score: 0,
-			};
-		}
-
-		const classification = classifyGoogleQuotaKind(snapshot);
-		return {
-			account,
-			kind: classification.kind,
-			summary: `${getGoogleQuotaBucketLabel(account, snapshot.models.length)} | bottleneck ${formatRemainingPercent(snapshot.worstRemainingPercent)} | ${formatQuotaKind(classification.kind)}`,
-			details: formatGoogleQuotaDetails(account, snapshot, classification.kind),
-			score: classification.score,
-		};
-	} catch (error: unknown) {
-		if (signal?.aborted || isAbortError(error)) throw error;
-		const message = error instanceof Error ? error.message : String(error);
-		return {
-			account,
-			kind: "error",
-			summary: message,
-			details: buildGoogleQuotaErrorDetails(account, message, projectId),
-			score: 0,
-		};
-	}
-}
-
 function normalizeQuotaAllowedProviderNames(cwd: string): string[] | undefined {
 	const project = loadProjectConfig(cwd);
 	if (!project?.allowedSubs || project.allowedSubs.length === 0) return undefined;
@@ -1215,12 +660,12 @@ function collectQuotaAccounts(ctx: ExtensionContext): QuotaAccount[] {
 			providerName,
 			baseProvider: getBaseProvider(providerName) || providerName,
 			displayName,
-			auth: ctx.modelRegistry.authStorage.get(providerName) as AuthStorageEntry | undefined,
+			auth: getAuthStorage(ctx).get(providerName) as AuthStorageEntry | undefined,
 		});
 	};
 
 	for (const checker of PROVIDER_QUOTA_CHECKERS) {
-		if (ctx.modelRegistry.authStorage.hasAuth(checker.baseProvider)) {
+		if (getAuthStorage(ctx).hasAuth(checker.baseProvider)) {
 			pushAccount(
 				checker.baseProvider,
 				PROVIDER_TEMPLATES[checker.baseProvider]?.displayName || checker.baseProvider,
@@ -1262,7 +707,7 @@ const codexQuotaChecker: ProviderQuotaChecker = {
 		const headers = new Headers({
 			Authorization: `Bearer ${auth.access}`,
 			Accept: "application/json",
-			"User-Agent": "pi-multi-pass",
+			"User-Agent": "pi-codex-multi",
 		});
 		if (accountId) {
 			headers.set("chatgpt-account-id", accountId);
@@ -1344,25 +789,7 @@ const codexQuotaChecker: ProviderQuotaChecker = {
 	},
 };
 
-const googleGeminiCliQuotaChecker: ProviderQuotaChecker = {
-	baseProvider: "google-gemini-cli",
-	async check(account: QuotaAccount, signal?: AbortSignal): Promise<QuotaCheckResult> {
-		return checkGoogleQuotaAccount(account, fetchGoogleGeminiQuotaSnapshot, signal);
-	},
-};
-
-const googleAntigravityQuotaChecker: ProviderQuotaChecker = {
-	baseProvider: "google-antigravity",
-	async check(account: QuotaAccount, signal?: AbortSignal): Promise<QuotaCheckResult> {
-		return checkGoogleQuotaAccount(account, fetchGoogleAntigravityQuotaSnapshot, signal);
-	},
-};
-
-const PROVIDER_QUOTA_CHECKERS: ProviderQuotaChecker[] = [
-	codexQuotaChecker,
-	googleGeminiCliQuotaChecker,
-	googleAntigravityQuotaChecker,
-];
+const PROVIDER_QUOTA_CHECKERS: ProviderQuotaChecker[] = [codexQuotaChecker];
 
 async function showQuotaDetails(
 	ctx: ExtensionCommandContext,
@@ -1482,7 +909,7 @@ type PoolSelectorFn =
 
 /** A named routing preset that maps to an ordered list of provider+model entries. */
 interface PresetEntry {
-	/** Provider name (e.g. "openai-codex", "anthropic-2") */
+	/** Provider name (e.g. "openai-codex", "openai-codex-2") */
 	provider: string;
 	/** Model ID to use */
 	model: string;
@@ -1582,22 +1009,41 @@ function emptyMultiPassConfig(): MultiPassConfig {
 	return { subscriptions: [], pools: [], chains: [], presets: [] };
 }
 
+function isCodexProviderName(value: unknown): value is string {
+	return typeof value === "string" && (value === "openai-codex" || /^openai-codex-\d+$/.test(value));
+}
+
+function normalizePools(pools: unknown): PoolConfig[] {
+	if (!Array.isArray(pools)) return [];
+	return pools
+		.filter((pool): pool is PoolConfig => Boolean(pool) && pool.baseProvider === "openai-codex" && Array.isArray(pool.members))
+		.map((pool) => ({ ...pool, members: pool.members.filter(isCodexProviderName) }))
+		.filter((pool) => pool.members.length > 0);
+}
+
 function normalizeMultiPassConfig(raw: unknown): MultiPassConfig {
 	const parsed = raw && typeof raw === "object" ? (raw as Partial<MultiPassConfig>) : {};
 	return {
-		subscriptions: Array.isArray(parsed.subscriptions) ? parsed.subscriptions : [],
-		pools: Array.isArray(parsed.pools) ? parsed.pools : [],
+		subscriptions: Array.isArray(parsed.subscriptions)
+			? parsed.subscriptions.filter((entry) => entry && entry.provider === "openai-codex")
+			: [],
+		pools: normalizePools(parsed.pools),
 		chains: Array.isArray(parsed.chains) ? parsed.chains : [],
-		presets: Array.isArray(parsed.presets) ? parsed.presets : [],
+		presets: Array.isArray(parsed.presets)
+			? parsed.presets
+				.filter((preset) => preset && Array.isArray(preset.entries))
+				.map((preset) => ({ ...preset, entries: preset.entries.filter((entry) => entry && isCodexProviderName(entry.provider)) }))
+				.filter((preset) => preset.entries.length > 0)
+			: [],
 	};
 }
 
 function normalizeProjectConfig(raw: unknown): ProjectConfig {
 	const parsed = raw && typeof raw === "object" ? (raw as Partial<ProjectConfig>) : {};
 	const config: ProjectConfig = {};
-	if (Array.isArray(parsed.pools)) config.pools = parsed.pools;
+	if (Array.isArray(parsed.pools)) config.pools = normalizePools(parsed.pools);
 	if (Array.isArray(parsed.chains)) config.chains = parsed.chains;
-	if (Array.isArray(parsed.allowedSubs)) config.allowedSubs = parsed.allowedSubs;
+	if (Array.isArray(parsed.allowedSubs)) config.allowedSubs = parsed.allowedSubs.filter(isCodexProviderName);
 	return config;
 }
 
@@ -1740,7 +1186,7 @@ function getProjectScopedProviderNames(
 	}
 
 	for (const providerName of SUPPORTED_PROVIDERS) {
-		if (ctx.modelRegistry.authStorage.hasAuth(providerName)) {
+		if (getAuthStorage(ctx).hasAuth(providerName)) {
 			push(providerName);
 		}
 	}
@@ -1755,7 +1201,7 @@ function findSelectableModelForProvider(
 	providerName: string,
 	preferredModelId?: string,
 ): Model<Api> | undefined {
-	if (!ctx.modelRegistry.authStorage.hasAuth(providerName)) {
+	if (!getAuthStorage(ctx).hasAuth(providerName)) {
 		return undefined;
 	}
 	if (preferredModelId) {
@@ -1768,7 +1214,7 @@ function findSelectableModelForProvider(
 	if (!baseProvider) {
 		return undefined;
 	}
-	for (const baseModel of getModels(baseProvider as any) as Model<Api>[]) {
+	for (const baseModel of getCodexModels()) {
 		const candidate = ctx.modelRegistry.find(providerName, baseModel.id);
 		if (candidate) {
 			return candidate as Model<Api>;
@@ -1874,8 +1320,8 @@ function getBaseProvider(providerName: string): string | undefined {
 // Model cloning
 // ==========================================================================
 
-function cloneModels(originalProvider: string, index: number) {
-	const models = getModels(originalProvider as any) as Model<Api>[];
+function cloneModels(index: number) {
+	const models = getCodexModels();
 	return models.map((m) => ({
 		id: m.id,
 		name: `${m.name} (#${index})`,
@@ -1900,17 +1346,13 @@ function registerSub(pi: ExtensionAPI, entry: SubEntry): void {
 	if (!template) return;
 
 	const name = subProviderName(entry);
-	const oauth = template.buildOAuth(entry.index);
-	const modifyModels = template.buildModifyModels?.(name);
-	const builtinModels = getModels(entry.provider as any) as Model<Api>[];
-	const baseUrl = builtinModels[0]?.baseUrl || "";
-	const models = cloneModels(entry.provider, entry.index);
+	const builtinModels = getCodexModels();
 
 	pi.registerProvider(name, {
-		baseUrl,
+		baseUrl: builtinModels[0]?.baseUrl || "",
 		api: builtinModels[0]?.api,
-		oauth: modifyModels ? { ...oauth, modifyModels } : oauth,
-		models,
+		oauth: template.buildOAuth(entry.index),
+		models: cloneModels(entry.index),
 	});
 }
 
@@ -2496,7 +1938,7 @@ class PoolManager {
 				const best = await this.getQuotaBestMember(
 					pool,
 					currentModel.provider,
-					ctx.modelRegistry.authStorage,
+					getAuthStorage(ctx),
 					cascade.attemptedProviders,
 				);
 				if (best) {
@@ -2659,7 +2101,7 @@ class PoolManager {
 		const plan = this.buildFailoverPlan(
 			currentModel,
 			config,
-			ctx.modelRegistry.authStorage,
+			getAuthStorage(ctx),
 			{
 				attemptedProviders: cascade.attemptedProviders,
 				visitedChainIndexes: cascade.visitedChainIndexes,
@@ -2792,7 +2234,7 @@ function getSwitchableProviderOptions(
 	const seen = new Set<string>();
 	const push = (providerName: string, label: string, description: string) => {
 		if (allowed && !allowed.has(providerName)) return;
-		if (!ctx.modelRegistry.authStorage.hasAuth(providerName)) return;
+		if (!getAuthStorage(ctx).hasAuth(providerName)) return;
 		if (seen.has(providerName)) return;
 		seen.add(providerName);
 		options.push({ providerName, label, description });
@@ -2816,7 +2258,7 @@ function resolveSwitchTargetModel(
 	providerName: string,
 	preferredModelId?: string,
 ): Model<Api> | undefined {
-	if (!ctx.modelRegistry.authStorage.hasAuth(providerName)) {
+	if (!getAuthStorage(ctx).hasAuth(providerName)) {
 		return undefined;
 	}
 	if (preferredModelId) {
@@ -2829,7 +2271,7 @@ function resolveSwitchTargetModel(
 	if (!baseProvider) {
 		return undefined;
 	}
-	for (const baseModel of getModels(baseProvider as any) as Model<Api>[]) {
+	for (const baseModel of getCodexModels()) {
 		const candidate = ctx.modelRegistry.find(providerName, baseModel.id);
 		if (candidate) {
 			return candidate as Model<Api>;
@@ -2932,8 +2374,8 @@ async function removeSubscriptionEntry(
 	if (!confirmed) return;
 
 	const name = subProviderName(entry);
-	if (ctx.modelRegistry.authStorage.hasAuth(name)) {
-		ctx.modelRegistry.authStorage.logout(name);
+	if (getAuthStorage(ctx).hasAuth(name)) {
+		getAuthStorage(ctx).logout(name);
 	}
 	pi.unregisterProvider(name);
 
@@ -2973,7 +2415,7 @@ async function showSubscriptionActions(
 			items: [
 				{
 					value: subProviderName(entry),
-					label: formatSubscriptionListLine(entry, config, ctx.modelRegistry.authStorage),
+					label: formatSubscriptionListLine(entry, config, getAuthStorage(ctx)),
 				},
 			],
 			confirmHint: "back",
@@ -2983,7 +2425,7 @@ async function showSubscriptionActions(
 	}
 
 	const name = subProviderName(entry);
-	const hasAuth = ctx.modelRegistry.authStorage.hasAuth(name);
+	const hasAuth = getAuthStorage(ctx).hasAuth(name);
 	const actionItems: SelectItem[] = [
 		{ value: "rename", label: "rename", description: "Change friendly label" },
 		hasAuth
@@ -3012,7 +2454,7 @@ async function showSubscriptionActions(
 		return;
 	}
 	if (action === "logout") {
-		ctx.modelRegistry.authStorage.logout(name);
+		getAuthStorage(ctx).logout(name);
 		ctx.modelRegistry.refresh();
 		ctx.ui.notify(`Logged out of ${subDisplayName(entry)}`, "info");
 		return;
@@ -3045,7 +2487,7 @@ async function handleSubsList(
 			items: all.map((entry) => ({
 				value: subProviderName(entry),
 				label: subDisplayName(entry),
-				description: formatSubscriptionMeta(entry, config, ctx.modelRegistry.authStorage),
+				description: formatSubscriptionMeta(entry, config, getAuthStorage(ctx)),
 			})),
 			initialValue: preferredProviderName,
 			confirmHint: "open",
@@ -3136,7 +2578,7 @@ async function handleSubsRemove(
 		items: config.subscriptions.map((entry) => ({
 			value: subProviderName(entry),
 			label: subDisplayName(entry),
-			description: ctx.modelRegistry.authStorage.hasAuth(subProviderName(entry))
+			description: getAuthStorage(ctx).hasAuth(subProviderName(entry))
 				? "logged in"
 				: "not logged in",
 		})),
@@ -3159,7 +2601,7 @@ async function handleSubsLogin(ctx: ExtensionCommandContext): Promise<void> {
 	const all = normalizeEntries(mergeConfigs(config, envEntries));
 
 	const notLoggedIn = all.filter(
-		(entry) => !ctx.modelRegistry.authStorage.hasAuth(subProviderName(entry)),
+		(entry) => !getAuthStorage(ctx).hasAuth(subProviderName(entry)),
 	);
 
 	if (notLoggedIn.length === 0) {
@@ -3201,7 +2643,7 @@ async function handleSubsLogout(ctx: ExtensionCommandContext): Promise<void> {
 	const all = normalizeEntries(mergeConfigs(config, envEntries));
 
 	const loggedIn = all.filter((entry) =>
-		ctx.modelRegistry.authStorage.hasAuth(subProviderName(entry)),
+		getAuthStorage(ctx).hasAuth(subProviderName(entry)),
 	);
 
 	if (loggedIn.length === 0) {
@@ -3226,7 +2668,7 @@ async function handleSubsLogout(ctx: ExtensionCommandContext): Promise<void> {
 	const entry = loggedIn.find((candidate) => subProviderName(candidate) === selectedProviderName);
 	if (!entry) return;
 
-	ctx.modelRegistry.authStorage.logout(subProviderName(entry));
+	getAuthStorage(ctx).logout(subProviderName(entry));
 	ctx.modelRegistry.refresh();
 	ctx.ui.notify(`Logged out of ${subDisplayName(entry)}`, "info");
 }
@@ -3244,8 +2686,8 @@ async function handleSubsStatus(ctx: ExtensionCommandContext): Promise<void> {
 	const lines: string[] = [];
 	for (const entry of all) {
 		const name = subProviderName(entry);
-		const cred = ctx.modelRegistry.authStorage.get(name);
-		const hasAuth = ctx.modelRegistry.authStorage.hasAuth(name);
+		const cred = getAuthStorage(ctx).get(name);
+		const hasAuth = getAuthStorage(ctx).hasAuth(name);
 
 		let status: string;
 		if (!hasAuth) {
@@ -3262,7 +2704,7 @@ async function handleSubsStatus(ctx: ExtensionCommandContext): Promise<void> {
 			status = "logged in (api key)";
 		}
 
-		const modelCount = (getModels(entry.provider as any) as Model<Api>[]).length;
+		const modelCount = (getCodexModels()).length;
 		const source = config.subscriptions.find(
 			(s) => s.provider === entry.provider && s.index === entry.index,
 		)
@@ -3510,14 +2952,14 @@ async function editPoolMembers(
 		const removableItems: SelectItem[] = selectedMembers.map((member) => ({
 			value: `remove:${member}`,
 			label: `remove ${member}`,
-			description: ctx.modelRegistry.authStorage.hasAuth(member) ? "logged in" : "not logged in",
+			description: getAuthStorage(ctx).hasAuth(member) ? "logged in" : "not logged in",
 		}));
 		const addableItems: SelectItem[] = availableProviders
 			.filter((providerName) => !selectedMembers.includes(providerName))
 			.map((providerName) => ({
 				value: `add:${providerName}`,
 				label: `add ${providerName}`,
-				description: ctx.modelRegistry.authStorage.hasAuth(providerName)
+				description: getAuthStorage(ctx).hasAuth(providerName)
 					? "logged in"
 					: "not logged in",
 			}));
@@ -3605,7 +3047,7 @@ async function promptForPoolDefinition(
 
 	const allProviders = getAllProvidersForBase(baseProvider, allSubs);
 	const authedProviders = allProviders.filter((p) =>
-		ctx.modelRegistry.authStorage.hasAuth(p),
+		getAuthStorage(ctx).hasAuth(p),
 	);
 
 	if (authedProviders.length === 0) {
@@ -3625,7 +3067,7 @@ async function promptForPoolDefinition(
 		const optionsList = [
 			`--- Selected (${members.length}): ${members.join(", ") || "none"} ---`,
 			...remaining.map((p) => {
-				const authed = ctx.modelRegistry.authStorage.hasAuth(p);
+				const authed = getAuthStorage(ctx).hasAuth(p);
 				return `${p} ${authed ? "[logged in]" : "[not logged in]"}`;
 			}),
 			"[Done - create pool]",
@@ -3789,7 +3231,7 @@ async function createAndPersistPool(
 }
 
 function getSelectableModelsForPool(pool: PoolConfig): string[] {
-	return (getModels(pool.baseProvider as any) as Model<Api>[]).map((model) => model.id);
+	return (getCodexModels()).map((model) => model.id);
 }
 
 function createChainValidationError(
@@ -3854,7 +3296,7 @@ async function inspectPoolConfig(
 	await showWrappedSelect(ctx, {
 		title: `Pool Status: ${pool.name}`,
 		subtitle: "Press Enter or Escape to go back to the pools list.",
-		items: formatPoolStatusLines(pool, ctx.modelRegistry.authStorage, poolManager)
+		items: formatPoolStatusLines(pool, getAuthStorage(ctx), poolManager)
 			.map((line, index) => ({ value: `${index}:${line}`, label: line })),
 		confirmHint: "back",
 		cancelHint: "back",
@@ -4099,7 +3541,7 @@ async function handlePoolList(
 			items: pools.map((pool) => ({
 				value: pool.name,
 				label: pool.name,
-				description: formatPoolListDescription(pool, ctx.modelRegistry.authStorage, poolManager),
+				description: formatPoolListDescription(pool, getAuthStorage(ctx), poolManager),
 			})),
 			initialValue: preferredPoolName,
 			confirmHint: "open",
@@ -4277,7 +3719,7 @@ async function handlePoolStatus(
 	const lines: string[] = [];
 	for (const pool of config.pools) {
 		lines.push(
-			...formatPoolStatusLines(pool, ctx.modelRegistry.authStorage, poolManager),
+			...formatPoolStatusLines(pool, getAuthStorage(ctx), poolManager),
 		);
 	}
 
@@ -4670,7 +4112,7 @@ async function handlePoolChainList(
 	await ctx.ui.select(
 		"Chains",
 		config.chains.map((chain) =>
-			formatChainListLine(chain, config, ctx.modelRegistry.authStorage, poolManager),
+			formatChainListLine(chain, config, getAuthStorage(ctx), poolManager),
 		),
 	);
 }
@@ -4750,7 +4192,7 @@ async function handlePoolChainStatus(
 
 	await ctx.ui.select(
 		`Chain Status: ${chain.name}`,
-		formatChainStatusLines(chain, config, ctx.modelRegistry.authStorage, poolManager),
+		formatChainStatusLines(chain, config, getAuthStorage(ctx), poolManager),
 	);
 }
 
@@ -4838,7 +4280,7 @@ async function handlePoolProject(
 		const allSubs = normalizeEntries(mergeConfigs(globalConf, envEntries));
 		const allProviderNames = [
 			...SUPPORTED_PROVIDERS.filter((p) =>
-				ctx.modelRegistry.authStorage.hasAuth(p),
+				getAuthStorage(ctx).hasAuth(p),
 			),
 			...allSubs.map((s) => subProviderName(s)),
 		];
@@ -4859,7 +4301,7 @@ async function handlePoolProject(
 			const options = [
 				`--- Allowed (${allowed.length}): ${allowed.join(", ") || "all (no restriction)"} ---`,
 				...remaining.map((p) => {
-					const authed = ctx.modelRegistry.authStorage.hasAuth(p);
+					const authed = getAuthStorage(ctx).hasAuth(p);
 					const current = currentAllowed.includes(p) ? " [currently allowed]" : "";
 					return `${p} ${authed ? "[logged in]" : "[not logged in]"}${current}`;
 				}),
@@ -4990,7 +4432,7 @@ async function handlePoolProject(
 		lines.push("");
 		lines.push(`Effective subs (${effective.subscriptions.length}):`);
 		for (const sub of effective.subscriptions) {
-			const authed = ctx.modelRegistry.authStorage.hasAuth(subProviderName(sub));
+			const authed = getAuthStorage(ctx).hasAuth(subProviderName(sub));
 			lines.push(`  ${subDisplayName(sub)} -- ${authed ? "logged in" : "not logged in"}`);
 		}
 
@@ -5052,7 +4494,7 @@ async function handleSubsMenu(
 		{ value: "logout", label: "logout", description: "Logout from a subscription" },
 		{ value: "switch", label: "switch", description: "Switch to a different subscription/provider now" },
 		{ value: "status", label: "status", description: "Show auth status and token info" },
-		{ value: "limits", label: "limits", description: "Check built-in quota support (Codex + Google)" },
+		{ value: "limits", label: "limits", description: "Check built-in Codex quota support" },
 	];
 	let preferredAction = "list";
 
@@ -5169,7 +4611,7 @@ async function handlePresetCreate(
 		const base = getBaseProvider(provider);
 		if (!base) continue;
 
-		const models = (getModels(base as any) as Model<Api>[]).map((m) => m.id);
+		const models = (getCodexModels()).map((m) => m.id);
 		if (models.length === 0) {
 			ctx.ui.notify(`No models available for ${provider}.`, "warning");
 			continue;
@@ -5261,7 +4703,7 @@ async function handlePresetActivate(
 
 	for (const entry of preset.entries) {
 		if (!entry.enabled) continue;
-		if (!ctx.modelRegistry.authStorage.hasAuth(entry.provider)) continue;
+		if (!getAuthStorage(ctx).hasAuth(entry.provider)) continue;
 		const model = ctx.modelRegistry.find(entry.provider, entry.model);
 		if (!model) continue;
 
@@ -5521,7 +4963,7 @@ export default function multiSub(pi: ExtensionAPI) {
 			if (pool) {
 				const available = poolManager.getAvailableMembers(
 					pool,
-					ctx.modelRegistry.authStorage,
+					getAuthStorage(ctx),
 				);
 				if (available.length === 0) {
 					ctx.ui.notify(
