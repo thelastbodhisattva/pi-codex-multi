@@ -2622,14 +2622,14 @@ async function loginSubscription(ctx: ExtensionCommandContext, entry: SubEntry):
 			onAuth(info) {
 				openBrowser(info.url);
 				ctx.ui.notify(
-					`${info.instructions ? `${info.instructions}\\n` : "Open this URL to authenticate:\\n"}${info.url}`,
+					`${info.instructions ? `${info.instructions}\n` : "Open this URL to authenticate:\n"}${info.url}`,
 					"info",
 				);
 			},
 			onDeviceCode(info) {
 				openBrowser(info.verificationUri);
 				ctx.ui.notify(
-					`Open ${info.verificationUri}\\nCode: ${info.userCode}`,
+					`Open ${info.verificationUri}\nCode: ${info.userCode}`,
 					"info",
 				);
 			},
@@ -2656,7 +2656,7 @@ async function loginSubscription(ctx: ExtensionCommandContext, entry: SubEntry):
 			authData = JSON.parse(readFileSync(authPath, "utf-8")) as Record<string, unknown>;
 		}
 		authData[providerName] = toOAuthCredential(credentials);
-		writeFileSync(authPath, `${JSON.stringify(authData, null, 2)}\\n`, { encoding: "utf-8", mode: 0o600 });
+		writeFileSync(authPath, `${JSON.stringify(authData, null, 2)}\n`, { encoding: "utf-8", mode: 0o600 });
 		try {
 			chmodSync(authPath, 0o600);
 		} catch {

@@ -7,5 +7,7 @@ assert.match(source, /readStoredCredential,/);
 assert.match(source, /function getAuthStorage\(/);
 assert.match(source, /getProviderAuthStatus\(provider\)\.configured/);
 assert.doesNotMatch(source, /ctx\.modelRegistry\.authStorage/);
+assert.match(source, /writeFileSync\(authPath, `\$\{JSON\.stringify\(authData, null, 2\)\}\\n`/);
+assert.doesNotMatch(source, /writeFileSync\(authPath, `\$\{JSON\.stringify\(authData, null, 2\)\}\\\\n`/);
 
 console.log("auth storage compatibility checks passed");
