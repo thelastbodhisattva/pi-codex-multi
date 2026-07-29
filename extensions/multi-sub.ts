@@ -29,6 +29,7 @@
  */
 
 import { chmodSync, existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
+import { spawn } from "node:child_process";
 import { dirname, join } from "path";
 import type {
 	ExtensionAPI,
@@ -2597,6 +2598,17 @@ async function handleSubsRemove(
 	return removeSubscriptionEntry(pi, ctx, config, entry, poolManager);
 }
 
+function openBrowser(target: string): void {
+	const [command, args] = process.platform === "darwin"
+		? ["open", [target]]
+		: process.platform === "win32"
+			? ["rundll32", ["url.dll,FileProtocolHandler", target]]
+			: ["xdg-open", [target]];
+	spawn(command, args, { stdio: "ignore", detached: true }).on("error", () => {
+		// The URL is still shown in the notification if no browser launcher exists.
+	});
+}
+
 async function loginSubscription(ctx: ExtensionCommandContext, entry: SubEntry): Promise<void> {
 	const providerName = subProviderName(entry);
 	const oauth = PROVIDER_TEMPLATES[entry.provider]?.buildOAuth(entry.index);
@@ -2608,12 +2620,14 @@ async function loginSubscription(ctx: ExtensionCommandContext, entry: SubEntry):
 	try {
 		const credentials = await oauth.login({
 			onAuth(info) {
+				openBrowser(info.url);
 				ctx.ui.notify(
 					`${info.instructions ? `${info.instructions}\\n` : "Open this URL to authenticate:\\n"}${info.url}`,
 					"info",
 				);
 			},
 			onDeviceCode(info) {
+				openBrowser(info.verificationUri);
 				ctx.ui.notify(
 					`Open ${info.verificationUri}\\nCode: ${info.userCode}`,
 					"info",
