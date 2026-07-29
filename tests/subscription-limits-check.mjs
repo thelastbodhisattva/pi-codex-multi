@@ -44,125 +44,9 @@ function classifyCodexQuotaKind(snapshot) {
   return { kind: "ready", score: bottleneck };
 }
 
-function normalizeGoogleRemainingPercent(value) {
-  if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
-  return Math.max(0, Math.min(100, Math.round(value * 100)));
-}
-
-function parseIsoTimestampSeconds(value) {
-  if (!value) return undefined;
-  const parsed = Date.parse(value);
-  if (!Number.isFinite(parsed)) return undefined;
-  return Math.floor(parsed / 1000);
-}
-
-function updateGoogleQuotaModel(modelsByName, model, remainingPercent, resetAt) {
-  const existing = modelsByName.get(model);
-  if (!existing) {
-    modelsByName.set(model, { model, remainingPercent, resetAt });
-    return;
-  }
-
-  let next = existing;
-  if (remainingPercent !== undefined) {
-    if (existing.remainingPercent === undefined || remainingPercent < existing.remainingPercent) {
-      next = { ...next, remainingPercent };
-    }
-  }
-  if (resetAt !== undefined) {
-    if (next.resetAt === undefined || resetAt < next.resetAt) {
-      next = { ...next, resetAt };
-    }
-  }
-  if (next !== existing) {
-    modelsByName.set(model, next);
-  }
-}
-
-function buildGoogleQuotaSnapshot(endpoint, projectId, modelsByName) {
-  const models = [...modelsByName.values()];
-  const remainingPercents = models
-    .map((model) => model.remainingPercent)
-    .filter((value) => value !== undefined);
-  const worstRemainingPercent = remainingPercents.length > 0
-    ? Math.min(...remainingPercents)
-    : undefined;
-
-  return { endpoint, projectId, models, worstRemainingPercent };
-}
-
-function getGoogleGeminiModelLabel(modelId) {
-  if (!modelId) return "unknown";
-  const normalized = modelId.toLowerCase();
-  if (normalized.includes("pro")) return "Pro";
-  if (normalized.includes("flash")) return "Flash";
-  return modelId;
-}
-
-function parseGoogleGeminiQuotaSnapshot(data, projectId) {
-  const buckets = Array.isArray(data?.buckets) ? data.buckets : [];
-  const modelsByName = new Map();
-
-  for (const bucket of buckets) {
-    const model = getGoogleGeminiModelLabel(typeof bucket?.modelId === "string" ? bucket.modelId : undefined);
-    const remainingPercent = normalizeGoogleRemainingPercent(bucket?.remainingFraction);
-    const resetAt = typeof bucket?.resetTime === "string"
-      ? parseIsoTimestampSeconds(bucket.resetTime)
-      : undefined;
-    if (remainingPercent === undefined && resetAt === undefined) continue;
-    updateGoogleQuotaModel(modelsByName, model, remainingPercent, resetAt);
-  }
-
-  return buildGoogleQuotaSnapshot(
-    "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota",
-    projectId,
-    modelsByName,
-  );
-}
-
-const GOOGLE_ANTIGRAVITY_HIDDEN_MODELS = new Set(["tab_flash_lite_preview"]);
-
-function parseGoogleAntigravityQuotaSnapshot(data, endpoint, projectId) {
-  const rawModels = data?.models && typeof data.models === "object" ? data.models : {};
-  const modelsByName = new Map();
-
-  for (const [modelKey, modelValue] of Object.entries(rawModels)) {
-    if (modelValue?.isInternal === true) continue;
-    if (GOOGLE_ANTIGRAVITY_HIDDEN_MODELS.has(modelKey.toLowerCase())) continue;
-
-    const displayName = typeof modelValue?.displayName === "string" && modelValue.displayName.length > 0
-      ? modelValue.displayName
-      : typeof modelValue?.model === "string" && modelValue.model.length > 0
-        ? modelValue.model
-        : modelKey;
-
-    if (GOOGLE_ANTIGRAVITY_HIDDEN_MODELS.has(displayName.toLowerCase())) continue;
-
-    const quotaInfo = modelValue?.quotaInfo || {};
-    const remainingPercent = normalizeGoogleRemainingPercent(quotaInfo.remainingFraction);
-    const resetAt = typeof quotaInfo.resetTime === "string"
-      ? parseIsoTimestampSeconds(quotaInfo.resetTime)
-      : undefined;
-    if (remainingPercent === undefined && resetAt === undefined) continue;
-    updateGoogleQuotaModel(modelsByName, displayName, remainingPercent, resetAt);
-  }
-
-  return buildGoogleQuotaSnapshot(endpoint, projectId, modelsByName);
-}
-
-function classifyGoogleQuotaKind(snapshot) {
-  const bottleneck = snapshot.worstRemainingPercent;
-  if (bottleneck === undefined) return { kind: "error", score: 0 };
-  if (bottleneck <= 5) return { kind: "blocked", score: bottleneck };
-  if (bottleneck <= 15) return { kind: "low", score: bottleneck };
-  if (bottleneck <= 30) return { kind: "watch", score: bottleneck };
-  return { kind: "ready", score: bottleneck };
-}
-
 function subDisplayName(entry) {
   const providerNames = {
     "openai-codex": "ChatGPT Plus/Pro (Codex)",
-    anthropic: "Anthropic (Claude Pro/Max)",
   };
   const providerName = `${providerNames[entry.provider] || entry.provider} #${entry.index}`;
   if (!entry.label) return providerName;
@@ -217,86 +101,6 @@ function runSeverityChecks() {
   assert.equal(classifyCodexQuotaKind({}).kind, "error");
 }
 
-function runGoogleGeminiQuotaParsingChecks() {
-  const snapshot = parseGoogleGeminiQuotaSnapshot({
-    buckets: [
-      {
-        modelId: "Gemini 2.5 Pro",
-        remainingFraction: 0.82,
-        resetTime: "2026-03-21T12:00:00Z",
-      },
-      {
-        modelId: "Gemini 2.5 Flash",
-        remainingFraction: 0.25,
-        resetTime: "2026-03-20T18:30:00Z",
-      },
-      {
-        modelId: "Gemini 2.5 Pro",
-        remainingFraction: 0.61,
-      },
-    ],
-  }, "project-123");
-
-  assert.equal(snapshot.projectId, "project-123");
-  assert.equal(snapshot.endpoint, "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota");
-  assert.equal(snapshot.models.length, 2);
-  assert.equal(snapshot.models.find((model) => model.model === "Pro")?.remainingPercent, 61);
-  assert.equal(snapshot.models.find((model) => model.model === "Flash")?.remainingPercent, 25);
-  assert.ok(snapshot.models.find((model) => model.model === "Pro")?.resetAt > 0);
-  assert.equal(snapshot.worstRemainingPercent, 25);
-}
-
-function runGoogleAntigravityQuotaParsingChecks() {
-  const snapshot = parseGoogleAntigravityQuotaSnapshot({
-    models: {
-      "gemini-3-pro-high": {
-        displayName: "G3 Pro",
-        quotaInfo: {
-          remainingFraction: 0.7,
-          resetTime: "2026-03-21T10:00:00Z",
-        },
-      },
-      duplicate: {
-        displayName: "G3 Pro",
-        quotaInfo: {
-          remainingFraction: 0.42,
-        },
-      },
-      hidden: {
-        displayName: "tab_flash_lite_preview",
-        quotaInfo: { remainingFraction: 0.99 },
-      },
-      internal: {
-        displayName: "Internal",
-        isInternal: true,
-        quotaInfo: { remainingFraction: 0.01 },
-      },
-      flash: {
-        model: "G3 Flash",
-        quotaInfo: {
-          remainingFraction: 0.88,
-          resetTime: "2026-03-20T18:30:00Z",
-        },
-      },
-    },
-  }, "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:fetchAvailableModels", "project-456");
-
-  assert.equal(snapshot.projectId, "project-456");
-  assert.equal(snapshot.models.length, 2);
-  assert.equal(snapshot.models.find((model) => model.model === "G3 Pro")?.remainingPercent, 42);
-  assert.equal(snapshot.models.find((model) => model.model === "G3 Flash")?.remainingPercent, 88);
-  assert.ok(snapshot.models.find((model) => model.model === "G3 Flash")?.resetAt > 0);
-  assert.equal(snapshot.worstRemainingPercent, 42);
-}
-
-function runGoogleClassificationChecks() {
-  assert.equal(classifyGoogleQuotaKind({ worstRemainingPercent: 80 }).kind, "ready");
-  assert.equal(classifyGoogleQuotaKind({ worstRemainingPercent: 25 }).kind, "watch");
-  assert.equal(classifyGoogleQuotaKind({ worstRemainingPercent: 10 }).kind, "low");
-  assert.equal(classifyGoogleQuotaKind({ worstRemainingPercent: 3 }).kind, "blocked");
-  assert.equal(classifyGoogleQuotaKind({ worstRemainingPercent: undefined }).kind, "error");
-}
-
 function runDisplayNameChecks() {
   assert.equal(
     subDisplayName({ provider: "openai-codex", index: 2 }),
@@ -310,8 +114,5 @@ function runDisplayNameChecks() {
 
 runWindowClassificationChecks();
 runSeverityChecks();
-runGoogleGeminiQuotaParsingChecks();
-runGoogleAntigravityQuotaParsingChecks();
-runGoogleClassificationChecks();
 runDisplayNameChecks();
 console.log("subscription limit checks passed");

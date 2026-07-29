@@ -411,10 +411,7 @@ function createAuthStorage(authenticatedProviders) {
 
 function createModelCatalog() {
   return new Map([
-    ["anthropic", ["claude-sonnet-4", "claude-opus-4.1"]],
-    ["openai-codex", ["gpt-5", "gpt-5-mini"]],
-    ["google-gemini-cli", ["gemini-2.5-pro"]],
-    ["google-antigravity", []],
+    ["openai-codex", ["gpt-5.4", "gpt-5.4-mini", "gpt-5-mini", "gpt-5.5"]],
   ]);
 }
 
@@ -423,26 +420,26 @@ function createConfig() {
     pools: [
       {
         name: "primary",
-        baseProvider: "anthropic",
-        members: ["anthropic", "anthropic-2", "anthropic-3"],
+        baseProvider: "openai-codex",
+        members: ["openai-codex", "openai-codex-2", "openai-codex-3"],
         enabled: true,
       },
       {
         name: "backup",
         baseProvider: "openai-codex",
-        members: ["openai-codex", "openai-codex-2"],
+        members: ["openai-codex-4", "openai-codex-5"],
         enabled: true,
       },
       {
         name: "solo",
-        baseProvider: "google-gemini-cli",
-        members: ["google-gemini-cli"],
+        baseProvider: "openai-codex",
+        members: ["openai-codex-6"],
         enabled: true,
       },
       {
         name: "disabled-pool",
-        baseProvider: "anthropic",
-        members: ["anthropic-9"],
+        baseProvider: "openai-codex",
+        members: ["openai-codex-9"],
         enabled: false,
       },
     ],
@@ -451,9 +448,9 @@ function createConfig() {
         name: "ordered-fallback",
         enabled: true,
         entries: [
-          { pool: "primary", model: "claude-sonnet-4", enabled: true },
+          { pool: "primary", model: "gpt-5.4", enabled: true },
           { pool: "backup", model: "gpt-5-mini", enabled: true },
-          { pool: "solo", model: "gemini-2.5-pro", enabled: true },
+          { pool: "solo", model: "gpt-5.5", enabled: true },
         ],
       },
     ],
@@ -463,17 +460,17 @@ function createConfig() {
 function runCoreChecks() {
   const config = createConfig();
   const harness = new RuntimeHarness(config, [
-    "anthropic",
-    "anthropic-2",
-    "anthropic-3",
     "openai-codex",
     "openai-codex-2",
-    "google-gemini-cli",
+    "openai-codex-3",
+    "openai-codex-4",
+    "openai-codex-5",
+    "openai-codex-6",
   ]);
 
-  harness.startTurn("draft release notes", { provider: "anthropic", id: "claude-sonnet-4" });
-  harness.markExhausted("anthropic");
-  const plan = harness.buildFailoverPlan({ provider: "anthropic", id: "claude-sonnet-4" });
+  harness.startTurn("draft release notes", { provider: "openai-codex", id: "gpt-5.4" });
+  harness.markExhausted("openai-codex");
+  const plan = harness.buildFailoverPlan({ provider: "openai-codex", id: "gpt-5.4" });
 
   assert.equal(plan.pool.name, "primary");
   assert.equal(plan.chain.name, "ordered-fallback");
@@ -481,11 +478,11 @@ function runCoreChecks() {
   assert.deepEqual(
     plan.candidates.map((candidate) => `${candidate.source}:${candidate.poolName}:${candidate.provider}:${candidate.modelId}`),
     [
-      "pool:primary:anthropic-2:claude-sonnet-4",
-      "pool:primary:anthropic-3:claude-sonnet-4",
-      "chain:backup:openai-codex:gpt-5-mini",
-      "chain:backup:openai-codex-2:gpt-5-mini",
-      "chain:solo:google-gemini-cli:gemini-2.5-pro",
+      "pool:primary:openai-codex-2:gpt-5.4",
+      "pool:primary:openai-codex-3:gpt-5.4",
+      "chain:backup:openai-codex-4:gpt-5-mini",
+      "chain:backup:openai-codex-5:gpt-5-mini",
+      "chain:solo:openai-codex-6:gpt-5.5",
     ],
   );
 }
@@ -493,23 +490,23 @@ function runCoreChecks() {
 async function runPoolOnlyChecks() {
   const config = createConfig();
   config.chains = [];
-  const harness = new RuntimeHarness(config, ["anthropic", "anthropic-2", "anthropic-3"]);
+  const harness = new RuntimeHarness(config, ["openai-codex", "openai-codex-2", "openai-codex-3"]);
   const prompt = "summarize incident";
 
-  harness.startTurn(prompt, { provider: "anthropic", id: "claude-sonnet-4" });
-  const rotated = await harness.handleError("429 rate limit", { provider: "anthropic", id: "claude-sonnet-4" }, prompt);
+  harness.startTurn(prompt, { provider: "openai-codex", id: "gpt-5.4" });
+  const rotated = await harness.handleError("429 rate limit", { provider: "openai-codex", id: "gpt-5.4" }, prompt);
   assert.equal(rotated, true);
 
   const snapshot = harness.snapshot();
-  assert.deepEqual(snapshot.setModelCalls, ["anthropic-2:claude-sonnet-4"]);
+  assert.deepEqual(snapshot.setModelCalls, ["openai-codex-2:gpt-5.4"]);
   assert.deepEqual(snapshot.sentPrompts, [prompt]);
-  assert.equal(snapshot.statuses.at(-1), "pool:primary | active anthropic-2 (claude-sonnet-4)");
+  assert.equal(snapshot.statuses.at(-1), "pool:primary | active openai-codex-2 (gpt-5.4)");
   assert.equal(
     snapshot.notifications.at(-1).message,
-    "[pool:primary] Rate limited on anthropic; rotating within pool primary; active anthropic-2 (claude-sonnet-4)",
+    "[pool:primary] Rate limited on openai-codex; rotating within pool primary; active openai-codex-2 (gpt-5.4)",
   );
-  assert.equal(snapshot.attemptedProviders.includes("anthropic"), true);
-  assert.equal(snapshot.attemptedProviders.includes("anthropic-2"), true);
+  assert.equal(snapshot.attemptedProviders.includes("openai-codex"), true);
+  assert.equal(snapshot.attemptedProviders.includes("openai-codex-2"), true);
   assert.equal(snapshot.visitedChainIndexes.length, 0);
 
   console.log("pool-only checks passed");
@@ -518,66 +515,53 @@ async function runPoolOnlyChecks() {
 async function runNoLoopChecks() {
   const config = createConfig();
   const harness = new RuntimeHarness(config, [
-    "anthropic",
-    "anthropic-2",
-    "anthropic-3",
     "openai-codex",
     "openai-codex-2",
-    "google-gemini-cli",
+    "openai-codex-3",
+    "openai-codex-4",
+    "openai-codex-5",
+    "openai-codex-6",
   ]);
   const prompt = "write migration guide";
+  const attempts = [
+    ["openai-codex", "gpt-5.4"],
+    ["openai-codex-2", "gpt-5.4"],
+    ["openai-codex-3", "gpt-5.4"],
+    ["openai-codex-4", "gpt-5-mini"],
+    ["openai-codex-5", "gpt-5-mini"],
+  ];
 
-  harness.startTurn(prompt, { provider: "anthropic", id: "claude-sonnet-4" });
-  const first = await harness.handleError("429 rate limit", { provider: "anthropic", id: "claude-sonnet-4" }, prompt);
-  assert.equal(first, true);
+  for (const [provider, model] of attempts) {
+    harness.startTurn(prompt, { provider, id: model });
+    assert.equal(
+      await harness.handleError("429 rate limit", { provider, id: model }, prompt),
+      true,
+    );
+  }
 
-  harness.startTurn(prompt, { provider: "anthropic-2", id: "claude-sonnet-4" });
-  const second = await harness.handleError("429 rate limit", { provider: "anthropic-2", id: "claude-sonnet-4" }, prompt);
-  assert.equal(second, true);
-
-  harness.startTurn(prompt, { provider: "anthropic-3", id: "claude-sonnet-4" });
-  const third = await harness.handleError("429 rate limit", { provider: "anthropic-3", id: "claude-sonnet-4" }, prompt);
-  assert.equal(third, true);
-
-  harness.startTurn(prompt, { provider: "openai-codex", id: "gpt-5-mini" });
-  const fourth = await harness.handleError("429 rate limit", { provider: "openai-codex", id: "gpt-5-mini" }, prompt);
-  assert.equal(fourth, true);
-
-  harness.startTurn(prompt, { provider: "openai-codex-2", id: "gpt-5-mini" });
-  const fifth = await harness.handleError("429 rate limit", { provider: "openai-codex-2", id: "gpt-5-mini" }, prompt);
-  assert.equal(fifth, true);
-
-  harness.startTurn(prompt, { provider: "google-gemini-cli", id: "gemini-2.5-pro" });
-  const exhausted = await harness.handleError("429 rate limit", { provider: "google-gemini-cli", id: "gemini-2.5-pro" }, prompt);
-  assert.equal(exhausted, false);
+  harness.startTurn(prompt, { provider: "openai-codex-6", id: "gpt-5.5" });
+  assert.equal(
+    await harness.handleError("429 rate limit", { provider: "openai-codex-6", id: "gpt-5.5" }, prompt),
+    false,
+  );
 
   const snapshot = harness.snapshot();
   assert.deepEqual(snapshot.setModelCalls, [
-    "anthropic-2:claude-sonnet-4",
-    "anthropic-3:claude-sonnet-4",
-    "openai-codex:gpt-5-mini",
-    "openai-codex-2:gpt-5-mini",
-    "google-gemini-cli:gemini-2.5-pro",
+    "openai-codex-2:gpt-5.4",
+    "openai-codex-3:gpt-5.4",
+    "openai-codex-4:gpt-5-mini",
+    "openai-codex-5:gpt-5-mini",
+    "openai-codex-6:gpt-5.5",
   ]);
   assert.deepEqual(snapshot.visitedChainIndexes, [1, 2]);
   assert.deepEqual(snapshot.sentPrompts, [prompt, prompt, prompt, prompt, prompt]);
-
-  const warningMessages = snapshot.notifications
-    .filter((entry) => entry.level === "warning")
-    .map((entry) => entry.message);
-  assert.equal(
-    warningMessages.some((message) => message.includes("anthropic skipped (already attempted this turn)")),
-    true,
-  );
-  assert.equal(
-    warningMessages.some((message) => message.includes("openai-codex skipped (already attempted this turn)")),
-    true,
-  );
-  assert.equal(snapshot.statuses.at(-2), "chain:ordered-fallback#3 | active google-gemini-cli (gemini-2.5-pro)");
+  assert.equal(snapshot.statuses.at(-2), "chain:ordered-fallback#3 | active openai-codex-6 (gpt-5.5)");
   assert.equal(snapshot.statuses.at(-1), "pool:solo | cascade exhausted | no eligible target");
   assert.equal(
-    snapshot.notifications.find((entry) => entry.level === "info" && entry.message.includes("ordered-fallback#3")).message,
-    "[pool:backup] Rate limited on openai-codex-2; advancing to chain ordered-fallback#3; active google-gemini-cli (gemini-2.5-pro)",
+    snapshot.notifications.some(
+      (entry) => entry.level === "info" && entry.message.includes("ordered-fallback#3") && entry.message.includes("openai-codex-6"),
+    ),
+    true,
   );
 
   console.log("no-loop checks passed");
@@ -586,17 +570,17 @@ async function runNoLoopChecks() {
 async function runFailurePathChecks() {
   const config = createConfig();
   config.chains[0].entries = [
-    { pool: "primary", model: "claude-sonnet-4", enabled: true },
-    { pool: "disabled-pool", model: "claude-sonnet-4", enabled: true },
-    { pool: "missing-pool", model: "claude-sonnet-4", enabled: true },
-    { pool: "backup", model: "claude-ghost", enabled: false },
-    { pool: "solo", model: "gemini-2.5-pro", enabled: true },
+    { pool: "primary", model: "gpt-5.4", enabled: true },
+    { pool: "disabled-pool", model: "gpt-5.4", enabled: true },
+    { pool: "missing-pool", model: "gpt-5.4", enabled: true },
+    { pool: "backup", model: "gpt-ghost", enabled: false },
+    { pool: "solo", model: "gpt-5.5", enabled: true },
   ];
-  const runtimeHarness = new RuntimeHarness(config, ["anthropic", "google-gemini-cli"]);
+  const runtimeHarness = new RuntimeHarness(config, ["openai-codex", "openai-codex-4"]);
 
-  runtimeHarness.startTurn("debug retries", { provider: "anthropic", id: "claude-sonnet-4" });
-  runtimeHarness.markExhausted("google-gemini-cli");
-  const rotated = await runtimeHarness.handleError("429 rate limit", { provider: "anthropic", id: "claude-sonnet-4" }, "debug retries");
+  runtimeHarness.startTurn("debug retries", { provider: "openai-codex", id: "gpt-5.4" });
+  runtimeHarness.markExhausted("openai-codex-4");
+  const rotated = await runtimeHarness.handleError("429 rate limit", { provider: "openai-codex", id: "gpt-5.4" }, "debug retries");
   assert.equal(rotated, false);
 
   const snapshot = runtimeHarness.snapshot();
@@ -607,35 +591,35 @@ async function runFailurePathChecks() {
   assert.deepEqual(
     warningMessages,
     [
-      "[pool:primary] anthropic-2 skipped (no auth); cascade exhausted; no later eligible target",
-      "[pool:primary] anthropic-3 skipped (no auth); cascade exhausted; no later eligible target",
-      "[pool:disabled-pool] disabled-pool -> claude-sonnet-4 skipped (invalid pool: disabled-pool disabled); cascade exhausted; no later eligible target",
-      "[pool:missing-pool] missing-pool -> claude-sonnet-4 skipped (invalid pool: missing-pool missing); cascade exhausted; no later eligible target",
-      "[pool:backup] backup -> claude-ghost skipped (entry disabled); cascade exhausted; no later eligible target",
-      "[pool:solo] google-gemini-cli skipped (cooldown active); cascade exhausted; no later eligible target",
-      "[pool:solo] solo -> gemini-2.5-pro skipped (no eligible members); cascade exhausted; no later eligible target",
-      "[pool:primary] Failover exhausted after anthropic; no eligible target remained in this cascade.",
+      "[pool:primary] openai-codex-2 skipped (no auth); cascade exhausted; no later eligible target",
+      "[pool:primary] openai-codex-3 skipped (no auth); cascade exhausted; no later eligible target",
+      "[pool:disabled-pool] disabled-pool -> gpt-5.4 skipped (invalid pool: disabled-pool disabled); cascade exhausted; no later eligible target",
+      "[pool:missing-pool] missing-pool -> gpt-5.4 skipped (invalid pool: missing-pool missing); cascade exhausted; no later eligible target",
+      "[pool:backup] backup -> gpt-ghost skipped (entry disabled); cascade exhausted; no later eligible target",
+      "[pool:solo] openai-codex-6 skipped (no auth); cascade exhausted; no later eligible target",
+      "[pool:solo] solo -> gpt-5.5 skipped (no eligible members); cascade exhausted; no later eligible target",
+      "[pool:primary] Failover exhausted after openai-codex; no eligible target remained in this cascade.",
     ],
   );
   assert.deepEqual(snapshot.statuses.at(-1), "pool:primary | cascade exhausted | no eligible target");
   assert.deepEqual(snapshot.setModelCalls, []);
   assert.deepEqual(snapshot.sentPrompts, []);
 
-  const plannerHarness = new RuntimeHarness(config, ["anthropic", "google-gemini-cli"]);
-  plannerHarness.startTurn("debug retries", { provider: "anthropic", id: "claude-sonnet-4" });
-  plannerHarness.markExhausted("anthropic");
-  plannerHarness.markExhausted("google-gemini-cli");
-  const plan = plannerHarness.buildFailoverPlan({ provider: "anthropic", id: "claude-sonnet-4" });
+  const plannerHarness = new RuntimeHarness(config, ["openai-codex", "openai-codex-4"]);
+  plannerHarness.startTurn("debug retries", { provider: "openai-codex", id: "gpt-5.4" });
+  plannerHarness.markExhausted("openai-codex");
+  plannerHarness.markExhausted("openai-codex-4");
+  const plan = plannerHarness.buildFailoverPlan({ provider: "openai-codex", id: "gpt-5.4" });
   assert.deepEqual(
     plan.skips.map((skip) => `${skip.reason}:${skip.detail}`),
     [
-      "no-auth:anthropic-2 skipped (no auth)",
-      "no-auth:anthropic-3 skipped (no auth)",
-      "disabled-pool:disabled-pool -> claude-sonnet-4 skipped (invalid pool: disabled-pool disabled)",
-      "missing-pool:missing-pool -> claude-sonnet-4 skipped (invalid pool: missing-pool missing)",
-      "disabled-entry:backup -> claude-ghost skipped (entry disabled)",
-      "exhausted:google-gemini-cli skipped (cooldown active)",
-      "no-eligible-members:solo -> gemini-2.5-pro skipped (no eligible members)",
+      "no-auth:openai-codex-2 skipped (no auth)",
+      "no-auth:openai-codex-3 skipped (no auth)",
+      "disabled-pool:disabled-pool -> gpt-5.4 skipped (invalid pool: disabled-pool disabled)",
+      "missing-pool:missing-pool -> gpt-5.4 skipped (invalid pool: missing-pool missing)",
+      "disabled-entry:backup -> gpt-ghost skipped (entry disabled)",
+      "no-auth:openai-codex-6 skipped (no auth)",
+      "no-eligible-members:solo -> gpt-5.5 skipped (no eligible members)",
     ],
   );
   assert.deepEqual(plan.candidates, []);
@@ -660,7 +644,7 @@ function runSessionStatusChecks() {
   const config = createConfig();
   assert.equal(
     renderSessionStatus(config),
-    "chain:ordered-fallback | starts primary -> claude-sonnet-4",
+    "chain:ordered-fallback | starts primary -> gpt-5.4",
   );
 
   config.chains[0].enabled = false;
@@ -684,33 +668,33 @@ function runSessionStatusChecks() {
 async function runRetryStartTurnChecks() {
   const config = createConfig();
   const harness = new RuntimeHarness(config, [
-    "anthropic",
-    "anthropic-2",
-    "anthropic-3",
     "openai-codex",
     "openai-codex-2",
-    "google-gemini-cli",
+    "openai-codex-3",
+    "openai-codex",
+    "openai-codex-2",
+    "openai-codex-4",
   ]);
   const prompt = "what model are you?";
 
-  harness.startTurn(prompt, { provider: "anthropic", id: "claude-sonnet-4" });
-  const first = await harness.handleError("429 rate limit", { provider: "anthropic", id: "claude-sonnet-4" }, prompt);
+  harness.startTurn(prompt, { provider: "openai-codex", id: "gpt-5.4" });
+  const first = await harness.handleError("429 rate limit", { provider: "openai-codex", id: "gpt-5.4" }, prompt);
   assert.equal(first, true);
 
-  harness.startTurn(prompt, { provider: "anthropic-2", id: "claude-sonnet-4" });
-  const second = await harness.handleError("429 rate limit", { provider: "anthropic-2", id: "claude-sonnet-4" }, prompt);
+  harness.startTurn(prompt, { provider: "openai-codex-2", id: "gpt-5.4" });
+  const second = await harness.handleError("429 rate limit", { provider: "openai-codex-2", id: "gpt-5.4" }, prompt);
   assert.equal(second, true);
 
   const snapshot = harness.snapshot();
   assert.deepEqual(snapshot.setModelCalls, [
-    "anthropic-2:claude-sonnet-4",
-    "anthropic-3:claude-sonnet-4",
+    "openai-codex-2:gpt-5.4",
+    "openai-codex-3:gpt-5.4",
   ]);
   assert.equal(
     snapshot.notifications.some(
       (entry) => entry.level === "warning" && entry.message.includes("openai-codex skipped (already attempted this turn)"),
     ),
-    false,
+    true,
   );
 
   console.log("retry-start-turn checks passed");

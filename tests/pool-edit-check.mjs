@@ -55,7 +55,7 @@ function runRenamePoolReferenceChecks() {
     {
       name: "secondary",
       entries: [
-        { pool: "work", model: "claude-sonnet-4", enabled: true },
+        { pool: "work", model: "gpt-5.4", enabled: true },
       ],
     },
   ];
@@ -80,7 +80,7 @@ function runRemovePoolReferenceChecks() {
     {
       name: "secondary",
       entries: [
-        { pool: "work", model: "claude-sonnet-4", enabled: true },
+        { pool: "work", model: "gpt-5.4", enabled: true },
       ],
     },
   ];

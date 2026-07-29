@@ -4658,7 +4658,7 @@ async function handlePresetList(ctx: ExtensionCommandContext): Promise<void> {
 
 	await showWrappedSelect(ctx, {
 		title: "Model Presets",
-		subtitle: "Presets are named routing shortcuts across providers.",
+		subtitle: "Presets are named routing shortcuts across Codex accounts.",
 		items,
 		confirmHint: "back",
 		cancelHint: "close",
@@ -5086,7 +5086,7 @@ export default function multiSub(pi: ExtensionAPI) {
 
 	// Register /mp-preset command (namespaced to avoid collision with pi's built-in /preset)
 	pi.registerCommand("mp-preset", {
-		description: "Manage multi-pass model presets (named routing shortcuts across providers)",
+		description: "Manage multi-pass model presets (named routing shortcuts across Codex accounts)",
 		getArgumentCompletions: (prefix: string) => {
 			const subcommands = ["activate", "create", "list", "toggle", "remove"];
 			const filtered = subcommands.filter((s) => s.startsWith(prefix));

@@ -112,9 +112,9 @@ function runExactProviderRestrictionCheck() {
         enabled: true,
       },
       {
-        name: "copilot-backup",
-        baseProvider: "github-copilot",
-        members: ["github-copilot"],
+        name: "legacy-backup",
+        baseProvider: "openai-codex",
+        members: ["openai-codex-3"],
         enabled: true,
       },
     ],
@@ -124,7 +124,7 @@ function runExactProviderRestrictionCheck() {
         enabled: true,
         entries: [
           { pool: "codex-work", model: "gpt-5", enabled: true },
-          { pool: "copilot-backup", model: "gpt-5", enabled: true },
+          { pool: "legacy-backup", model: "gpt-5", enabled: true },
         ],
       },
     ],
