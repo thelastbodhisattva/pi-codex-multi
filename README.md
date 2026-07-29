@@ -24,13 +24,13 @@ This fork does not register Anthropic, GitHub Copilot, Gemini CLI, Antigravity, 
 ## Quick start
 
 ```
-/subs add
-/login
+/subs add          # choose OpenAI Codex and label the account
+/subs login        # runs OAuth for the selected subscription
 /subs limits
 /pool create
 ```
 
-Add another ChatGPT account with `/subs add`, then authenticate `openai-codex-2`. When an account hits a rate limit, the extension retries with the next eligible Codex account in its pool or chain.
+`/subs login` now runs the OAuth flow and stores credentials for the selected provider (for example `openai-codex-2`). `/login openai-codex-2` remains available as Pi's native equivalent. When an account hits a rate limit, the extension retries with the next eligible Codex account in its pool or chain.
 
 ## Configuration
 
@@ -81,6 +81,10 @@ export MULTI_SUB="openai-codex:2"
 - `/subs` — add, remove, login, logout, switch, list, status, and limits
 - `/pool` — create, list, inspect, toggle, remove, and configure project pools/chains
 - `/mp-preset` — create, activate, list, toggle, and remove Codex model presets
+
+### Pool strategies
+
+`/pool create` asks for a strategy; existing pools expose it through their action menu. The default is **`round-robin`**. Other choices are `quota-first`, `scheduled`, and `custom`.
 
 ## Codex quota support
 

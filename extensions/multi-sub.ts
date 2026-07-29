@@ -28,7 +28,7 @@
  *   - openai-codex (ChatGPT Plus/Pro Codex)
  */
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
+import { chmodSync, existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
 import { dirname, join } from "path";
 import type {
 	ExtensionAPI,
@@ -1013,11 +1013,19 @@ function isCodexProviderName(value: unknown): value is string {
 	return typeof value === "string" && (value === "openai-codex" || /^openai-codex-\d+$/.test(value));
 }
 
+function isPoolStrategy(value: unknown): value is PoolStrategy {
+	return value === "round-robin" || value === "quota-first" || value === "scheduled" || value === "custom";
+}
+
 function normalizePools(pools: unknown): PoolConfig[] {
 	if (!Array.isArray(pools)) return [];
 	return pools
 		.filter((pool): pool is PoolConfig => Boolean(pool) && pool.baseProvider === "openai-codex" && Array.isArray(pool.members))
-		.map((pool) => ({ ...pool, members: pool.members.filter(isCodexProviderName) }))
+		.map((pool) => ({
+			...pool,
+			members: pool.members.filter(isCodexProviderName),
+			strategy: isPoolStrategy(pool.strategy) ? pool.strategy : "round-robin",
+		}))
 		.filter((pool) => pool.members.length > 0);
 }
 
@@ -2447,10 +2455,7 @@ async function showSubscriptionActions(
 		return renameSubscriptionLabel(ctx, config, entry);
 	}
 	if (action === "login") {
-		ctx.ui.notify(
-			`Use /login and select "${PROVIDER_TEMPLATES[entry.provider]?.buildOAuth(entry.index).name}" to authenticate.`,
-			"info",
-		);
+		await loginSubscription(ctx, entry);
 		return;
 	}
 	if (action === "logout") {
@@ -2551,10 +2556,7 @@ async function handleSubsAdd(pi: ExtensionAPI, ctx: ExtensionCommandContext): Pr
 	);
 
 	if (loginNow) {
-		ctx.ui.notify(
-			`Use /login and select "${PROVIDER_TEMPLATES[entry.provider]?.buildOAuth(entry.index).name}" to authenticate.`,
-			"info",
-		);
+		await loginSubscription(ctx, entry);
 	} else {
 		ctx.ui.notify(`Added ${subDisplayName(entry)}. Use /subs login to authenticate.`, "info");
 	}
@@ -2595,6 +2597,65 @@ async function handleSubsRemove(
 	return removeSubscriptionEntry(pi, ctx, config, entry, poolManager);
 }
 
+async function loginSubscription(ctx: ExtensionCommandContext, entry: SubEntry): Promise<void> {
+	const providerName = subProviderName(entry);
+	const oauth = PROVIDER_TEMPLATES[entry.provider]?.buildOAuth(entry.index);
+	if (!oauth) {
+		ctx.ui.notify(`Unsupported subscription provider: ${entry.provider}`, "error");
+		return;
+	}
+
+	try {
+		const credentials = await oauth.login({
+			onAuth(info) {
+				ctx.ui.notify(
+					`${info.instructions ? `${info.instructions}\\n` : "Open this URL to authenticate:\\n"}${info.url}`,
+					"info",
+				);
+			},
+			onDeviceCode(info) {
+				ctx.ui.notify(
+					`Open ${info.verificationUri}\\nCode: ${info.userCode}`,
+					"info",
+				);
+			},
+			onProgress(message) {
+				ctx.ui.notify(message, "info");
+			},
+			async onPrompt(prompt) {
+				return (await ctx.ui.input(prompt.message, prompt.placeholder)) ?? "";
+			},
+			async onManualCodeInput() {
+				return (await ctx.ui.input("Enter the authorization code")) ?? "";
+			},
+			async onSelect(prompt) {
+				const options = prompt.options.map((option) => `${option.id} — ${option.label}`);
+				const selected = await ctx.ui.select(prompt.message, options);
+				if (!selected) return undefined;
+				return prompt.options[options.indexOf(selected)]?.id;
+			},
+		});
+
+		const authPath = join(getAgentDir(), "auth.json");
+		let authData: Record<string, unknown> = {};
+		if (existsSync(authPath)) {
+			authData = JSON.parse(readFileSync(authPath, "utf-8")) as Record<string, unknown>;
+		}
+		authData[providerName] = toOAuthCredential(credentials);
+		writeFileSync(authPath, `${JSON.stringify(authData, null, 2)}\\n`, { encoding: "utf-8", mode: 0o600 });
+		try {
+			chmodSync(authPath, 0o600);
+		} catch {
+			// Windows ignores POSIX mode bits; the write still succeeded.
+		}
+		ctx.modelRegistry.refresh();
+		ctx.ui.notify(`Logged in to ${subDisplayName(entry)}.`, "info");
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		ctx.ui.notify(`Login failed for ${subDisplayName(entry)}: ${message}`, "error");
+	}
+}
+
 async function handleSubsLogin(ctx: ExtensionCommandContext): Promise<void> {
 	const config = loadGlobalConfig();
 	const envEntries = parseEnvConfig();
@@ -2631,10 +2692,7 @@ async function handleSubsLogin(ctx: ExtensionCommandContext): Promise<void> {
 	const entry = notLoggedIn.find((candidate) => subProviderName(candidate) === selectedProviderName);
 	if (!entry) return;
 
-	ctx.ui.notify(
-		`Use /login and select "${PROVIDER_TEMPLATES[entry.provider]?.buildOAuth(entry.index).name}" to authenticate.`,
-		"info",
-	);
+	await loginSubscription(ctx, entry);
 }
 
 async function handleSubsLogout(ctx: ExtensionCommandContext): Promise<void> {
@@ -2830,10 +2888,8 @@ function buildPoolConfig(input: {
 		baseProvider: input.baseProvider,
 		members: [...input.members],
 		enabled: input.enabled ?? true,
+		strategy: input.strategy ?? "round-robin",
 	};
-	if (input.strategy && input.strategy !== "round-robin") {
-		pool.strategy = input.strategy;
-	}
 	if (input.memberSchedule && Object.keys(input.memberSchedule).length > 0) {
 		pool.memberSchedule = input.memberSchedule;
 	}
