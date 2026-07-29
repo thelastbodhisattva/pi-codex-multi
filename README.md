@@ -4,7 +4,13 @@ Pi extension exclusively for ChatGPT Plus/Pro subscriptions through OpenAI Codex
 
 ## Install
 
-Install directly from the fork:
+Install from npm:
+
+```bash
+pi install npm:pi-codex-multi
+```
+
+For development, install directly from the fork:
 
 ```bash
 pi install git:github.com/thelastbodhisattva/pi-codex-multi
