@@ -22,6 +22,7 @@ assert.ok(
   "extension guard must wrap rotation",
 );
 assert.match(getNextMember, /getAvailableMembers\(pool, authStorage\)/);
+assert.match(source, /sendUserMessage\(lastUserPrompt, \{ deliverAs: "followUp" \}\)/);
 
 class Harness {
   constructor(pool, authenticated, cooldown, modelId) {
