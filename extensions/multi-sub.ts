@@ -4989,7 +4989,46 @@ export default function multiSub(pi: ExtensionAPI) {
 			return { action: "continue" as const };
 		}
 		const ok = await enforceProjectRestriction(ctx, "input");
-		return ok ? { action: "continue" as const } : { action: "handled" as const };
+		if (!ok) return { action: "handled" as const };
+
+		if (event.source !== "extension" && ctx.model) {
+			const pool = poolManager.getPoolForProvider(ctx.model.provider);
+			if (pool?.enabled && (pool.strategy || "round-robin") === "round-robin") {
+				const nextProvider = poolManager.getNextMember(
+					pool,
+					ctx.model.provider,
+					getAuthStorage(ctx),
+				);
+				if (nextProvider) {
+					const nextModel = ctx.modelRegistry.find(nextProvider, ctx.model.id);
+					if (!nextModel) {
+						ctx.ui.notify(
+							`multi-pass: ${nextProvider} lacks ${ctx.model.id}; keeping ${ctx.model.provider}.`,
+							"warning",
+						);
+					} else {
+						try {
+							const switched = await pi.setModel(nextModel as Model<Api>);
+							if (switched) {
+								ctx.ui.setStatus("multi-pass", `round-robin: ${nextProvider}`);
+							} else {
+								ctx.ui.notify(
+									`multi-pass: could not switch to ${nextProvider}; keeping ${ctx.model.provider}.`,
+									"warning",
+								);
+							}
+						} catch {
+							ctx.ui.notify(
+								`multi-pass: could not switch to ${nextProvider}; keeping ${ctx.model.provider}.`,
+								"warning",
+							);
+						}
+					}
+				}
+			}
+		}
+
+		return { action: "continue" as const };
 	});
 
 	// Track last user prompt for retry on rotation
