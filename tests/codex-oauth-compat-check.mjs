@@ -23,6 +23,8 @@ assert.doesNotMatch(
 );
 assert.match(source, /from "@earendil-works\/pi-ai\/providers\/all"/);
 assert.match(source, /id === "openai-codex"/);
+assert.match(source, /refreshToken\(credentials: OAuthCredentials, signal: AbortSignal\)/);
+assert.match(source, /openaiCodexOAuth\.refresh\(toOAuthCredential\(credentials\), signal\)/);
 
 const events = [];
 const interaction = createOAuthInteraction(callbacks({

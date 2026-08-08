@@ -113,8 +113,8 @@ const PROVIDER_TEMPLATES: Record<string, ProviderTemplate> = {
 				async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
 					return openaiCodexOAuth.login(createOAuthInteraction(callbacks));
 				},
-				async refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
-					return openaiCodexOAuth.refresh(toOAuthCredential(credentials));
+				async refreshToken(credentials: OAuthCredentials, signal: AbortSignal): Promise<OAuthCredentials> {
+					return openaiCodexOAuth.refresh(toOAuthCredential(credentials), signal);
 				},
 				getApiKey(credentials: OAuthCredentials): string {
 					return credentials.access;
