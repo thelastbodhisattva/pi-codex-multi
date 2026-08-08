@@ -1,6 +1,6 @@
 {
   "name": "pi-codex-multi",
-  "version": "1.3.3",
+  "version": "1.3.4",
   "description": "Pi extension for multiple ChatGPT Plus/Pro Codex OAuth subscriptions with failover pools",
   "keywords": [
     "pi-package",

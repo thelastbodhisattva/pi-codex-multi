@@ -39,6 +39,7 @@ const interaction = createOAuthInteraction(callbacks({
     return "browser";
   },
 }));
+assert.equal(typeof interaction.signal?.addEventListener, "function");
 
 interaction.notify({ type: "auth_url", url: "https://example.test", instructions: "Sign in" });
 interaction.notify({

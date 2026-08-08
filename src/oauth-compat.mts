@@ -94,8 +94,9 @@ async function promptLegacyOAuth(
 }
 
 export function createOAuthInteraction(callbacks: OAuthLoginCallbacks): AuthInteraction {
+	const signal = callbacks.signal ?? new AbortController().signal;
 	return {
-		signal: callbacks.signal,
+		signal,
 		notify: (event) => notifyLegacyOAuth(callbacks, event),
 		prompt: (prompt) => promptLegacyOAuth(callbacks, prompt),
 	};
