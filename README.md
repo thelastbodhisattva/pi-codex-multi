@@ -25,8 +25,26 @@ pi install git:github.com/thelastbodhisattva/pi-codex-multi
 - Fallback chains and Codex-only model presets
 - Project-level allow-lists and pool/chain overrides
 - Retry progress preserved across failover attempts
+- Failover cascade tries every eligible candidate before giving up (bounded
+  by the optional `maxRetries` setting, default 99; previously the bound was
+  the implicit pool size)
+- Transient provider overload ("overloaded"/"capacity"/5xx) rotates once
+  without marking the account exhausted; only genuine per-account limits
+  (429/quota/usage-limit wording) trigger cooldowns
+- Exhaustion cooldowns honor `Retry-After` or the account's known quota reset
+  when available (clamped to 60s–30min, otherwise a 5-minute fallback), and
+  survive restarts via `~/.pi/agent/multi-pass.state.json`
 
 This fork does not register Anthropic, GitHub Copilot, Gemini CLI, Antigravity, or arbitrary providers. Legacy non-Codex config entries are ignored rather than causing startup failures.
+
+## Security notes
+
+- Custom pool selector scripts (`selectorScript`) are honored **only** from
+  the global config (`~/.pi/agent/multi-pass.json`). Project-level
+  `.pi/multi-pass.json` files have `selectorScript` stripped during load, so a
+  checked-in project file cannot execute arbitrary code. **Breaking change:**
+  pools that previously defined `selectorScript` in project config must move
+  that setting to the global config.
 
 ## Quick start
 
@@ -67,9 +85,13 @@ Project overrides: `.pi/multi-pass.json`
         { "provider": "openai-codex", "model": "gpt-5.4", "enabled": true }
       ]
     }
-  ]
+  ],
+  "maxRetries": 99
 }
 ```
+
+`maxRetries` bounds how many failover switch attempts one cascade may make
+across pool members and chain entries (default 99).
 
 Restrict a project to exact Codex accounts:
 

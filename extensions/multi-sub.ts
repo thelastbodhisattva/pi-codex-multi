@@ -28,9 +28,9 @@
  *   - openai-codex (ChatGPT Plus/Pro Codex)
  */
 
-import { chmodSync, existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync, statSync, unlinkSync } from "fs";
 import { spawn } from "node:child_process";
-import { dirname, join } from "path";
+import { basename, dirname, isAbsolute, join } from "path";
 import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
@@ -73,12 +73,24 @@ function getAuthStorage(ctx: {
 				const data = JSON.parse(readFileSync(authPath, "utf-8")) as Record<string, unknown>;
 				if (!data[provider]) return;
 				delete data[provider];
-				writeFileSync(authPath, `${JSON.stringify(data, null, 2)}\n`, "utf-8");
+				writeJsonAtomic(authPath, data);
 			} catch {
 				// Missing or unreadable auth storage means there is nothing to log out.
 			}
 		},
 	};
+}
+
+/** setModel that never throws; returns false when the switch fails or errors,
+ *  so callers can treat both uniformly like the round-robin branch does. */
+async function safeSetModel(pi: ExtensionAPI, model: Model<Api>): Promise<boolean> {
+	try {
+		return await pi.setModel(model);
+	} catch (error) {
+		const detail = error instanceof Error ? error.message : String(error);
+		console.warn(`multi-pass: model switch to ${model.provider}/${model.id} failed: ${detail}`);
+		return false;
+	}
 }
 
 // ==========================================================================
@@ -159,6 +171,9 @@ interface QuotaCheckResult {
 	summary: string;
 	details: string[];
 	score: number;
+	/** Earliest known reset timestamp (epoch seconds) for this account's
+	 *  usage windows, if the provider reported one. */
+	resetAt?: number;
 }
 
 interface ProviderQuotaChecker {
@@ -572,18 +587,37 @@ async function runQuotaChecks(
 	accounts: QuotaAccount[],
 	signal?: AbortSignal,
 ): Promise<QuotaCheckResult[]> {
+	// 30s TTL cache: /subs limits and quota-first strategy can both hit
+	// wham/usage within seconds; reuse fresh results instead of re-fetching.
 	const results = await Promise.all(accounts.map(async (account) => {
+		const cached = quotaResultCache.get(account.providerName);
+		if (cached && cached.expires > Date.now()) return cached.result;
 		const checker = PROVIDER_QUOTA_CHECKERS.find(
 			(candidate) => candidate.baseProvider === account.baseProvider,
 		);
 		if (!checker) return undefined;
-		return checker.check(account, signal);
+		const result = await checker.check(account, signal);
+		quotaResultCache.set(account.providerName, { expires: Date.now() + QUOTA_CACHE_TTL_MS, result });
+		return result;
 	}));
 
 	return results
 		.filter((result): result is QuotaCheckResult => Boolean(result))
 		.sort(compareQuotaResults);
 }
+
+/** Latest future reset timestamp (epoch seconds) known for a provider from a
+ *  recent quota check, or undefined. Used to size exhaustion cooldowns. */
+function getCachedQuotaResetAt(providerName: string): number | undefined {
+	const cached = quotaResultCache.get(providerName);
+	if (!cached || cached.expires <= Date.now()) return undefined;
+	const resetAt = cached.result.resetAt;
+	return typeof resetAt === "number" && resetAt * 1000 > Date.now() ? resetAt : undefined;
+}
+
+/** 30s TTL cache for wham/usage quota results (see runQuotaChecks). */
+const QUOTA_CACHE_TTL_MS = 30 * 1000;
+const quotaResultCache = new Map<string, { expires: number; result: QuotaCheckResult }>();
 
 async function loadQuotaResults(
 	ctx: ExtensionCommandContext,
@@ -743,6 +777,11 @@ const codexQuotaChecker: ProviderQuotaChecker = {
 			}
 			const fiveHourLeft = getCodexWindowRemaining(snapshot.fiveHour);
 			const weeklyLeft = getCodexWindowRemaining(snapshot.weekly);
+			// Earliest future window reset = when this account can serve again.
+			const futureResets = [snapshot.fiveHour?.resetAt, snapshot.weekly?.resetAt].filter(
+				(reset): reset is number => typeof reset === "number" && reset * 1000 > Date.now(),
+			);
+			const nextResetAt = futureResets.length > 0 ? Math.min(...futureResets) : undefined;
 			const classification = classifyCodexQuotaKind(snapshot);
 			const summary = [
 				snapshot.planType !== "unknown" ? snapshot.planType : "plan unknown",
@@ -770,6 +809,7 @@ const codexQuotaChecker: ProviderQuotaChecker = {
 				summary,
 				details,
 				score: classification.score,
+				resetAt: nextResetAt,
 			};
 		} catch (error: unknown) {
 			if (signal?.aborted || isAbortError(error)) throw error;
@@ -972,6 +1012,9 @@ interface MultiPassConfig {
 	pools: PoolConfig[];
 	chains: ChainConfig[];
 	presets: PresetConfig[];
+	/** Upper bound on extension-driven failover switch attempts per cascade.
+	 *  Previously this was implicitly bounded by the pool member count. */
+	maxRetries?: number;
 }
 
 /** Project-level config (.pi/multi-pass.json) */
@@ -1006,9 +1049,61 @@ function projectConfigPath(cwd: string): string {
 	return join(cwd, ".pi", "multi-pass.json");
 }
 
-function emptyMultiPassConfig(): MultiPassConfig {
-	return { subscriptions: [], pools: [], chains: [], presets: [] };
+/** Write JSON atomically: temp file in the same directory, then rename over
+ *  the target. A crash mid-write leaves a leftover .tmp file behind instead of
+ *  a truncated target; readers ignore .tmp files, so state survives. */
+function writeJsonAtomic(path: string, data: unknown, mode = 0o600): void {
+	const dir = dirname(path);
+	if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+	const tmp = join(dir, `.${basename(path)}.${process.pid}.${Date.now()}.tmp`);
+	writeFileSync(tmp, `${JSON.stringify(data, null, 2)}\n`, { encoding: "utf-8", mode });
+	try {
+		renameSync(tmp, path);
+	} catch (error) {
+		try {
+			unlinkSync(tmp);
+		} catch {
+			// Leftover temp file is harmless; readers ignore it.
+		}
+		throw error;
+	}
 }
+
+// ==========================================================================
+// Persisted pool exhaustion state (~/.pi/agent/multi-pass.state.json)
+// ==========================================================================
+
+interface PersistedPoolState {
+	pools: Record<string, Record<string, number>>;
+}
+
+function multiPassStatePath(): string {
+	return join(getAgentDir(), "multi-pass.state.json");
+}
+
+/** Persist exhausted-until timestamps atomically; prunes expired entries. */
+function saveExhaustedState(pools: Map<string, Record<string, number>>): void {
+	const now = Date.now();
+	const out: PersistedPoolState = { pools: {} };
+	for (const [poolName, members] of pools) {
+		for (const [provider, until] of Object.entries(members)) {
+			if (until <= now) delete members[provider];
+			else {
+				(out.pools[poolName] ??= {})[provider] = until;
+			}
+		}
+		if (Object.keys(members).length === 0) delete out.pools[poolName];
+	}
+	writeJsonAtomic(multiPassStatePath(), out);
+}
+
+function emptyMultiPassConfig(): MultiPassConfig {
+	return { subscriptions: [], pools: [], chains: [], presets: [], maxRetries: DEFAULT_MAX_RETRIES };
+}
+
+/** Default bound on extension-driven failover attempts per cascade.
+ *  Before this knob existed the bound was the implicit pool size. */
+const DEFAULT_MAX_RETRIES = 99;
 
 function isCodexProviderName(value: unknown): value is string {
 	return typeof value === "string" && (value === "openai-codex" || /^openai-codex-\d+$/.test(value));
@@ -1044,13 +1139,26 @@ function normalizeMultiPassConfig(raw: unknown): MultiPassConfig {
 				.map((preset) => ({ ...preset, entries: preset.entries.filter((entry) => entry && isCodexProviderName(entry.provider)) }))
 				.filter((preset) => preset.entries.length > 0)
 			: [],
+		maxRetries:
+			typeof parsed.maxRetries === "number" && Number.isFinite(parsed.maxRetries) && parsed.maxRetries >= 1
+				? Math.floor(parsed.maxRetries)
+				: DEFAULT_MAX_RETRIES,
 	};
 }
 
 function normalizeProjectConfig(raw: unknown): ProjectConfig {
 	const parsed = raw && typeof raw === "object" ? (raw as Partial<ProjectConfig>) : {};
 	const config: ProjectConfig = {};
-	if (Array.isArray(parsed.pools)) config.pools = normalizePools(parsed.pools);
+	if (Array.isArray(parsed.pools)) {
+		// Security: strip selectorScript (and any other executable-path fields)
+		// from project config. Custom selector code is only honored from the
+		// global admin-controlled config, never from a checked-in project file.
+		config.pools = normalizePools(parsed.pools).map((pool) => {
+			const stripped = { ...pool };
+			delete stripped.selectorScript;
+			return stripped;
+		});
+	}
 	if (Array.isArray(parsed.chains)) config.chains = parsed.chains;
 	if (Array.isArray(parsed.allowedSubs)) config.allowedSubs = parsed.allowedSubs.filter(isCodexProviderName);
 	return config;
@@ -1109,19 +1217,41 @@ function filterChainsByAvailablePools(chains: ChainConfig[], pools: PoolConfig[]
 		.filter((chain) => chain.entries.length > 0);
 }
 
+let effectiveConfigCache: { key: string; value: EffectiveConfig } | null = null;
+
+function statMtimeMs(path: string): number {
+	try {
+		return statSync(path).mtimeMs;
+	} catch {
+		return -1;
+	}
+}
+
+function invalidateEffectiveConfigCache(): void {
+	effectiveConfigCache = null;
+}
+
 function loadEffectiveConfig(cwd: string): EffectiveConfig {
+	// mtime-based cache: loadEffectiveConfig runs on every input/agent_end and
+	// re-reads both config files each time; the key changes whenever a file is
+	// written (or MULTI_SUB changes), so saves self-invalidate.
+	const key = `${cwd}|${statMtimeMs(globalConfigPath())}|${statMtimeMs(projectConfigPath(cwd))}|${process.env.MULTI_SUB ?? ""}`;
+	if (effectiveConfigCache && effectiveConfigCache.key === key) return effectiveConfigCache.value;
+
 	const global = loadGlobalConfig();
 	const envEntries = parseEnvConfig();
 	const mergedSubscriptions = normalizeEntries(mergeConfigs(global, envEntries));
 	const project = loadProjectConfig(cwd);
 
 	if (!project) {
-		return {
+		const value: EffectiveConfig = {
 			subscriptions: mergedSubscriptions,
 			pools: global.pools,
 			chains: global.chains,
 			presets: global.presets,
 		};
+		effectiveConfigCache = { key, value };
+		return value;
 	}
 
 	const allowedProviderNames = normalizeAllowedProviderNames(project.allowedSubs);
@@ -1138,7 +1268,7 @@ function loadEffectiveConfig(cwd: string): EffectiveConfig {
 		chains = filterChainsByAvailablePools(chains, pools);
 	}
 
-	return {
+	const value: EffectiveConfig = {
 		subscriptions: subs,
 		pools,
 		chains,
@@ -1146,20 +1276,19 @@ function loadEffectiveConfig(cwd: string): EffectiveConfig {
 		allowedProviderNames,
 		projectConfigPath: projectConfigPath(cwd),
 	};
+	effectiveConfigCache = { key, value };
+	return value;
 }
 
 function saveGlobalConfig(config: MultiPassConfig): void {
 	const path = globalConfigPath();
-	const dir = dirname(path);
-	if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-	writeFileSync(path, JSON.stringify(config, null, 2), "utf-8");
+	invalidateEffectiveConfigCache();
+	writeJsonAtomic(path, config);
 }
 
 function saveProjectConfig(cwd: string, config: ProjectConfig): void {
-	const path = projectConfigPath(cwd);
-	const dir = dirname(path);
-	if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-	writeFileSync(path, JSON.stringify(config, null, 2), "utf-8");
+	invalidateEffectiveConfigCache();
+	writeJsonAtomic(projectConfigPath(cwd), config);
 }
 
 function getProviderDisplayName(providerName: string, subscriptions: SubEntry[]): string {
@@ -1369,19 +1498,58 @@ function registerSub(pi: ExtensionAPI, entry: SubEntry): void {
 // Pool rotation engine
 // ==========================================================================
 
-const RATE_LIMIT_PATTERNS = [
+// Genuine per-account limits: this account is done until its window resets.
+const PER_ACCOUNT_LIMIT_PATTERNS = [
 	/usage.?limit/i,
 	/rate.?limit/i,
 	/limit.*reached/i,
 	/too many requests/i,
-	/overloaded/i,
-	/capacity/i,
-	/429/,
+	/\b429\b/,
 	/quota/i,
 ];
 
+// Transient provider overload: rotate once but do NOT burn the account.
+const TRANSIENT_OVERLOAD_PATTERNS = [
+	/overloaded/i,
+	/capacity/i,
+	/\b5\d{2}\b/,
+];
+
 function isRateLimitError(errorMessage: string): boolean {
-	return RATE_LIMIT_PATTERNS.some((p) => p.test(errorMessage));
+	return (
+		PER_ACCOUNT_LIMIT_PATTERNS.some((p) => p.test(errorMessage))
+		|| TRANSIENT_OVERLOAD_PATTERNS.some((p) => p.test(errorMessage))
+	);
+}
+
+/** True for transient overload ("overloaded"/"capacity"/5xx) that does NOT
+ *  also carry per-account limit wording — such errors rotate once without
+ *  marking the account exhausted. */
+function isTransientOverloadError(errorMessage: string): boolean {
+	if (PER_ACCOUNT_LIMIT_PATTERNS.some((p) => p.test(errorMessage))) return false;
+	return TRANSIENT_OVERLOAD_PATTERNS.some((p) => p.test(errorMessage));
+}
+
+// ==========================================================================
+// Retry-aware cooldown math
+// ==========================================================================
+
+const MIN_EXHAUSTED_MS = 60 * 1000; // 1 min floor
+const MAX_EXHAUSTED_MS = 30 * 60 * 1000; // 30 min cap
+const DEFAULT_EXHAUSTED_MS = 5 * 60 * 1000; // 5 min fallback
+
+/** Pull a Retry-After delay (seconds) out of an error message, if present. */
+function parseRetryAfterSeconds(errorMessage: string): number | undefined {
+	const match = /retry[- ]?after\D{0,10}(\d{1,5})/i.exec(errorMessage);
+	if (!match) return undefined;
+	const seconds = Number(match[1]);
+	return Number.isFinite(seconds) && seconds >= 0 ? seconds : undefined;
+}
+
+/** Clamp an exhaustion TTL: floor 60s, cap 30min, fallback 5min. */
+function clampExhaustedMs(ttlMs: number | undefined): number {
+	if (ttlMs === undefined || !Number.isFinite(ttlMs) || ttlMs <= 0) return DEFAULT_EXHAUSTED_MS;
+	return Math.min(Math.max(ttlMs, MIN_EXHAUSTED_MS), MAX_EXHAUSTED_MS);
 }
 
 // ==========================================================================
@@ -1507,7 +1675,7 @@ function getScheduledMemberOrder(
 const selectorCache = new Map<string, PoolSelectorFn | null>();
 
 function resolveSelectorScriptPath(scriptPath: string): string {
-	if (scriptPath.startsWith("/")) return scriptPath;
+	if (isAbsolute(scriptPath)) return scriptPath;
 	if (scriptPath.startsWith("~/")) {
 		const home = process.env.HOME || process.env.USERPROFILE || "";
 		return join(home, scriptPath.slice(2));
@@ -1536,7 +1704,9 @@ async function loadSelectorScript(scriptPath: string): Promise<PoolSelectorFn | 
 		selectorCache.set(resolved, fn);
 		return fn;
 	} catch {
-		selectorCache.set(resolved, null);
+		// Do not negatively cache import failures: the script may be fixed or
+		// created after this attempt. Return uncached so the next call retries.
+		selectorCache.delete(resolved);
 		return null;
 	}
 }
@@ -1584,10 +1754,9 @@ async function runCustomSelector(
 interface PoolState {
 	/** Current index into pool.members */
 	currentIndex: number;
-	/** Members that are temporarily "exhausted" (hit limit), with timestamps */
+	/** Members currently "exhausted" (hit a per-account limit), mapped to an
+	 *  absolute until-timestamp (epoch ms). Expired entries are pruned lazily. */
 	exhausted: Map<string, number>;
-	/** Cooldown period in ms before retrying an exhausted member */
-	cooldownMs: number;
 }
 
 class PoolManager {
@@ -1609,7 +1778,6 @@ class PoolManager {
 			state = {
 				currentIndex: 0,
 				exhausted: new Map(),
-				cooldownMs: 5 * 60 * 1000, // 5 min default cooldown
 			};
 			this.poolStates.set(poolName, state);
 		}
@@ -1659,23 +1827,20 @@ class PoolManager {
 		authStorage: { hasAuth(provider: string): boolean },
 	): string[] {
 		const state = this.getOrCreatePoolState(pool.name);
-		const now = Date.now();
 		return pool.members.filter((member) => {
 			if (!authStorage.hasAuth(member)) return false;
-			const exhaustedAt = state.exhausted.get(member);
-			if (exhaustedAt && now - exhaustedAt < state.cooldownMs) return false;
-			if (exhaustedAt && now - exhaustedAt >= state.cooldownMs) {
-				state.exhausted.delete(member);
-			}
+			const exhaustedUntil = state.exhausted.get(member);
+			if (exhaustedUntil !== undefined && Date.now() < exhaustedUntil) return false;
+			if (exhaustedUntil !== undefined) state.exhausted.delete(member);
 			return true;
 		});
 	}
 
 	isMemberExhausted(pool: PoolConfig, provider: string): boolean {
 		const state = this.getOrCreatePoolState(pool.name);
-		const exhaustedAt = state.exhausted.get(provider);
-		if (!exhaustedAt) return false;
-		if (Date.now() - exhaustedAt >= state.cooldownMs) {
+		const exhaustedUntil = state.exhausted.get(provider);
+		if (exhaustedUntil === undefined) return false;
+		if (Date.now() >= exhaustedUntil) {
 			state.exhausted.delete(provider);
 			return false;
 		}
@@ -1843,28 +2008,74 @@ class PoolManager {
 		};
 	}
 
-	/** Mark a member as exhausted (hit rate limit) */
-	markExhausted(providerName: string): void {
+	/** Mark a member as exhausted (hit a per-account rate limit).
+	 *  cooldownMs may come from a Retry-After header or the account's known
+	 *  quota reset; clamped to [60s, 30min], defaulting to 5min. */
+	markExhausted(providerName: string, cooldownMs?: number): void {
 		const poolName = this.providerToPool.get(providerName);
 		if (!poolName) return;
 		const state = this.getOrCreatePoolState(poolName);
-		state.exhausted.set(providerName, Date.now());
+		state.exhausted.set(providerName, Date.now() + clampExhaustedMs(cooldownMs));
+		this.persistExhaustedState();
 	}
 
-	/** Get the next available member in a pool, skipping the current one */
+	/** Derive the exhaustion cooldown for a provider: Retry-After from the
+	 *  error message first, then the account's cached quota reset timestamp,
+	 *  then the default fallback. Values are clamped in clampExhaustedMs. */
+	private resolveExhaustedMs(providerName: string, errorMessage: string): number | undefined {
+		const retryAfter = parseRetryAfterSeconds(errorMessage);
+		if (retryAfter !== undefined) return retryAfter * 1000;
+		const resetAt = getCachedQuotaResetAt(providerName);
+		if (resetAt !== undefined) return resetAt * 1000 - Date.now();
+		return undefined;
+	}
+
+	/** Best-effort persistence of exhaustion timestamps across processes. */
+	private persistExhaustedState(): void {
+		try {
+			const pools = new Map<string, Record<string, number>>();
+			for (const [poolName, state] of this.poolStates) {
+				if (state.exhausted.size > 0) pools.set(poolName, Object.fromEntries(state.exhausted));
+			}
+			saveExhaustedState(pools);
+		} catch {
+			// Persistence is best-effort; in-memory rotation still works.
+		}
+	}
+
+	/** Load persisted exhaustion timestamps (called on session_start). */
+	loadPersistedState(): void {
+		try {
+			const path = multiPassStatePath();
+			if (!existsSync(path)) return;
+			const raw = JSON.parse(readFileSync(path, "utf-8")) as PersistedPoolState;
+			const now = Date.now();
+			for (const [poolName, members] of Object.entries(raw.pools ?? {})) {
+				const state = this.poolStates.get(poolName);
+				if (!state) continue;
+				for (const [provider, until] of Object.entries(members)) {
+					if (typeof until === "number" && until > now) state.exhausted.set(provider, until);
+				}
+			}
+		} catch {
+			// Corrupt or leftover temp state files are ignored.
+		}
+	}
+
+	/** Get the next available member in a pool, skipping the current one.
+	 *  Returns the candidate without mutating the round-robin pointer; the
+	 *  caller commits via commitRoundRobin only after a confirmed switch. */
 	getNextMember(
 		pool: PoolConfig,
 		currentProvider: string,
 		authStorage: { hasAuth(provider: string): boolean },
-	): string | undefined {
+	): { provider: string; index: number } | undefined {
 		const state = this.getOrCreatePoolState(pool.name);
 		const available = this.getAvailableMembers(pool, authStorage);
 		if (available.length === 0) return undefined;
 
 		const poolSize = pool.members.length;
-		if (poolSize <= 1) {
-			return available[0] === currentProvider ? undefined : available[0];
-		}
+		if (poolSize <= 1) return undefined;
 
 		const currentIndex = pool.members.indexOf(currentProvider);
 		const startIndex = currentIndex >= 0 ? currentIndex : state.currentIndex % poolSize;
@@ -1874,11 +2085,17 @@ class PoolManager {
 			const candidate = pool.members[candidateIndex];
 			if (candidate === currentProvider) continue;
 			if (!available.includes(candidate)) continue;
-			state.currentIndex = candidateIndex;
-			return candidate;
+			return { provider: candidate, index: candidateIndex };
 		}
 
 		return undefined;
+	}
+
+	/** Advance the round-robin pointer only after a confirmed successful
+	 *  switch; a failed switch leaves the previous index intact (rollback by
+	 *  not committing). */
+	commitRoundRobin(poolName: string, index: number): void {
+		this.getOrCreatePoolState(poolName).currentIndex = index;
 	}
 
 	/**
@@ -2023,20 +2240,9 @@ class PoolManager {
 		}
 	}
 
-	private ensureCascadeState(prompt: string | null, currentModel: Model<Api>): FailoverCascadeState {
-		if (!prompt) {
-			const fallbackState: FailoverCascadeState = {
-				prompt: "",
-				attemptedProviders: new Set([currentModel.provider]),
-				visitedChainIndexes: new Set<number>(),
-			};
-			this.cascadeState = fallbackState;
-			return fallbackState;
-		}
-
-		if (!this.cascadeState || this.cascadeState.prompt !== prompt) {
+	private ensureCascadeState(currentModel: Model<Api>): FailoverCascadeState {
+		if (!this.cascadeState) {
 			this.cascadeState = {
-				prompt,
 				attemptedProviders: new Set([currentModel.provider]),
 				visitedChainIndexes: new Set<number>(),
 			};
@@ -2047,26 +2253,22 @@ class PoolManager {
 		return this.cascadeState;
 	}
 
-	startTurn(prompt: string | null, currentModel?: Model<Api>): void {
+	startTurn(currentModel?: Model<Api>): void {
 		if (this.suppressNextStartTurn) {
+			// This turn is our own failover followUp retry; keep the cascade
+			// state so already-attempted providers stay excluded.
 			this.suppressNextStartTurn = false;
 			return;
 		}
-		if (!prompt) {
-			this.cascadeState = null;
-			return;
-		}
-		if (!this.cascadeState || this.cascadeState.prompt !== prompt) {
-			this.cascadeState = {
-				prompt,
-				attemptedProviders: new Set(currentModel ? [currentModel.provider] : []),
-				visitedChainIndexes: new Set<number>(),
-			};
-			return;
-		}
-		if (currentModel) {
-			this.cascadeState.attemptedProviders.add(currentModel.provider);
-		}
+		// Reset cascade state on every user turn. Cascade identity is the turn,
+		// not prompt-string equality: two identical consecutive prompts are two
+		// distinct turns and must not inherit each other's attempted set.
+		this.cascadeState = currentModel
+			? {
+					attemptedProviders: new Set([currentModel.provider]),
+					visitedChainIndexes: new Set<number>(),
+				}
+			: null;
 	}
 
 	clearCascadeState(): void {
@@ -2074,11 +2276,10 @@ class PoolManager {
 	}
 
 	getCascadeStateSnapshot():
-		| { prompt: string; attemptedProviders: string[]; visitedChainIndexes: number[] }
+		| { attemptedProviders: string[]; visitedChainIndexes: number[] }
 		| null {
 		if (!this.cascadeState) return null;
 		return {
-			prompt: this.cascadeState.prompt,
 			attemptedProviders: [...this.cascadeState.attemptedProviders],
 			visitedChainIndexes: [...this.cascadeState.visitedChainIndexes],
 		};
@@ -2102,10 +2303,16 @@ class PoolManager {
 		const pool = this.getPoolForProvider(currentModel.provider);
 		if (!pool) return false;
 
-		const cascade = this.ensureCascadeState(lastUserPrompt, currentModel);
+		const cascade = this.ensureCascadeState(currentModel);
 
-		// Mark current as exhausted before planning the forward-only cascade.
-		this.markExhausted(currentModel.provider);
+		// Only genuine per-account limits burn the account. Transient overload
+		// ("overloaded"/"capacity"/5xx) rotates once without marking it.
+		if (!isTransientOverloadError(errorMessage)) {
+			this.markExhausted(
+				currentModel.provider,
+				this.resolveExhaustedMs(currentModel.provider, errorMessage),
+			);
+		}
 
 		const plan = this.buildFailoverPlan(
 			currentModel,
@@ -2135,52 +2342,71 @@ class PoolManager {
 			);
 		}
 
-		const nextCandidate = plan.candidates[0];
-		if (!nextCandidate) {
-			ctx.ui.notify(formatFailoverExhausted(pool.name, currentModel.provider), "warning");
-			ctx.ui.setStatus("multi-pass", formatFailoverStatus(null, pool.name));
-			return false;
-		}
+		// Try candidates in order; a failed switch continues to the next
+		// candidate instead of declaring the cascade exhausted. The number of
+		// extension-driven switch attempts is bounded by config.maxRetries.
+		const maxAttempts = Math.max(1, config.maxRetries ?? DEFAULT_MAX_RETRIES);
+		let attempts = 0;
+		for (const nextCandidate of plan.candidates) {
+			if (attempts >= maxAttempts) {
+				ctx.ui.notify(
+					`[pool:${pool.name}] failover attempt bound reached (${maxAttempts}); stopping cascade`,
+					"warning",
+				);
+				break;
+			}
 
-		const nextModel = ctx.modelRegistry.find(nextCandidate.provider, nextCandidate.modelId);
-		if (!nextModel) {
+			const nextModel = ctx.modelRegistry.find(nextCandidate.provider, nextCandidate.modelId);
+			if (!nextModel) {
+				ctx.ui.notify(
+					`[pool:${nextCandidate.poolName}] ${nextCandidate.provider} -> ${nextCandidate.modelId} skipped (model missing at runtime); trying next candidate`,
+					"warning",
+				);
+				continue;
+			}
+
+			attempts++;
+			let success: boolean;
+			try {
+				success = await this.pi.setModel(nextModel);
+			} catch (error) {
+				const detail = error instanceof Error ? error.message : String(error);
+				ctx.ui.notify(
+					`[pool:${nextCandidate.poolName}] ${nextCandidate.provider} switch failed (${detail}); trying next candidate`,
+					"warning",
+				);
+				continue;
+			}
+			if (!success) {
+				ctx.ui.notify(
+					`[pool:${nextCandidate.poolName}] ${nextCandidate.provider} skipped (authentication unavailable during switch); trying next candidate`,
+					"warning",
+				);
+				continue;
+			}
+
+			cascade.attemptedProviders.add(nextCandidate.provider);
+			if (typeof nextCandidate.chainIndex === "number") {
+				cascade.visitedChainIndexes.add(nextCandidate.chainIndex);
+			}
+
 			ctx.ui.notify(
-				`[pool:${nextCandidate.poolName}] ${nextCandidate.provider} -> ${nextCandidate.modelId} skipped (model missing at runtime); cascade exhausted; no later eligible target`,
-				"warning",
+				formatFailoverTransition(pool.name, currentModel.provider, nextCandidate),
+				"info",
 			);
-			ctx.ui.notify(formatFailoverExhausted(pool.name, currentModel.provider), "warning");
-			ctx.ui.setStatus("multi-pass", formatFailoverStatus(null, pool.name));
-			return false;
+			ctx.ui.setStatus("multi-pass", formatFailoverStatus(nextCandidate));
+
+			if (lastUserPrompt) {
+				this.suppressNextStartTurn = true;
+				this.pi.sendUserMessage(lastUserPrompt, { deliverAs: "followUp" });
+			}
+
+			return true;
 		}
 
-		const success = await this.pi.setModel(nextModel);
-		if (!success) {
-			ctx.ui.notify(
-				`[pool:${nextCandidate.poolName}] ${nextCandidate.provider} skipped (authentication unavailable during switch); cascade exhausted; no later eligible target`,
-				"warning",
-			);
-			ctx.ui.notify(formatFailoverExhausted(pool.name, currentModel.provider), "warning");
-			ctx.ui.setStatus("multi-pass", formatFailoverStatus(null, pool.name));
-			return false;
-		}
-
-		cascade.attemptedProviders.add(nextCandidate.provider);
-		if (typeof nextCandidate.chainIndex === "number") {
-			cascade.visitedChainIndexes.add(nextCandidate.chainIndex);
-		}
-
-		ctx.ui.notify(
-			formatFailoverTransition(pool.name, currentModel.provider, nextCandidate),
-			"info",
-		);
-		ctx.ui.setStatus("multi-pass", formatFailoverStatus(nextCandidate));
-
-		if (lastUserPrompt) {
-			this.suppressNextStartTurn = true;
-			this.pi.sendUserMessage(lastUserPrompt, { deliverAs: "followUp" });
-		}
-
-		return true;
+		ctx.ui.notify(formatFailoverExhausted(pool.name, currentModel.provider), "warning");
+		ctx.ui.setStatus("multi-pass", formatFailoverStatus(null, pool.name));
+		return false;
 	}
 
 	getPoolConfigs(): PoolConfig[] {
@@ -2337,7 +2563,7 @@ async function handleSubsSwitch(
 		return;
 	}
 
-	const success = await pi.setModel(nextModel);
+	const success = await safeSetModel(pi, nextModel);
 	if (!success) {
 		ctx.ui.notify(`Failed to switch to ${selected.label}.`, "error");
 		return;
@@ -2646,7 +2872,9 @@ async function loginSubscription(ctx: ExtensionCommandContext, entry: SubEntry):
 				const options = prompt.options.map((option) => `${option.id} — ${option.label}`);
 				const selected = await ctx.ui.select(prompt.message, options);
 				if (!selected) return undefined;
-				return prompt.options[options.indexOf(selected)]?.id;
+				// Map back by id, not by display string index.
+				const id = selected.slice(0, selected.indexOf(" — "));
+				return prompt.options.find((option) => option.id === id)?.id;
 			},
 		});
 
@@ -2656,12 +2884,7 @@ async function loginSubscription(ctx: ExtensionCommandContext, entry: SubEntry):
 			authData = JSON.parse(readFileSync(authPath, "utf-8")) as Record<string, unknown>;
 		}
 		authData[providerName] = toOAuthCredential(credentials);
-		writeFileSync(authPath, `${JSON.stringify(authData, null, 2)}\n`, { encoding: "utf-8", mode: 0o600 });
-		try {
-			chmodSync(authPath, 0o600);
-		} catch {
-			// Windows ignores POSIX mode bits; the write still succeeded.
-		}
+		writeJsonAtomic(authPath, authData);
 		ctx.modelRegistry.refresh();
 		ctx.ui.notify(`Logged in to ${subDisplayName(entry)}.`, "info");
 	} catch (error) {
@@ -3859,7 +4082,6 @@ interface FailoverPlan {
 }
 
 interface FailoverCascadeState {
-	prompt: string;
 	attemptedProviders: Set<string>;
 	visitedChainIndexes: Set<number>;
 }
@@ -4777,7 +4999,7 @@ async function handlePresetActivate(
 		const model = ctx.modelRegistry.find(entry.provider, entry.model);
 		if (!model) continue;
 
-		const success = await pi.setModel(model);
+		const success = await safeSetModel(pi, model);
 		if (!success) continue;
 
 		const prettyEntry = formatPresetEntryWith(entry, allSubs);
@@ -4929,7 +5151,7 @@ export default function multiSub(pi: ExtensionAPI) {
 
 			projectRestrictionSwitchInFlight = true;
 			try {
-				const success = await pi.setModel(model);
+				const success = await safeSetModel(pi, model);
 				if (!success) continue;
 				const displayName = getProviderDisplayName(providerName, effective.subscriptions);
 				ctx.ui.notify(
@@ -4954,6 +5176,7 @@ export default function multiSub(pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		const effective = loadEffectiveConfig(ctx.cwd);
 		poolManager.loadPools(effective.pools);
+		poolManager.loadPersistedState();
 
 		const statusParts: string[] = [];
 		const enabledChains = effective.chains.filter((chain) => chain.enabled);
@@ -4994,32 +5217,36 @@ export default function multiSub(pi: ExtensionAPI) {
 		if (event.source !== "extension" && ctx.model) {
 			const pool = poolManager.getPoolForProvider(ctx.model.provider);
 			if (pool?.enabled && (pool.strategy || "round-robin") === "round-robin") {
-				const nextProvider = poolManager.getNextMember(
+				const selection = poolManager.getNextMember(
 					pool,
 					ctx.model.provider,
 					getAuthStorage(ctx),
 				);
-				if (nextProvider) {
-					const nextModel = ctx.modelRegistry.find(nextProvider, ctx.model.id);
+				if (selection) {
+					const nextModel = ctx.modelRegistry.find(selection.provider, ctx.model.id);
 					if (!nextModel) {
 						ctx.ui.notify(
-							`multi-pass: ${nextProvider} lacks ${ctx.model.id}; keeping ${ctx.model.provider}.`,
+							`multi-pass: ${selection.provider} lacks ${ctx.model.id}; keeping ${ctx.model.provider}.`,
 							"warning",
 						);
 					} else {
 						try {
 							const switched = await pi.setModel(nextModel as Model<Api>);
 							if (switched) {
-								ctx.ui.setStatus("multi-pass", `round-robin: ${nextProvider}`);
+								// Commit-on-success: only advance the round-robin
+								// pointer after the switch is confirmed; a failed
+								// switch leaves the previous index intact.
+								poolManager.commitRoundRobin(pool.name, selection.index);
+								ctx.ui.setStatus("multi-pass", `round-robin: ${selection.provider}`);
 							} else {
 								ctx.ui.notify(
-									`multi-pass: could not switch to ${nextProvider}; keeping ${ctx.model.provider}.`,
+									`multi-pass: could not switch to ${selection.provider}; keeping ${ctx.model.provider}.`,
 									"warning",
 								);
 							}
 						} catch {
 							ctx.ui.notify(
-								`multi-pass: could not switch to ${nextProvider}; keeping ${ctx.model.provider}.`,
+								`multi-pass: could not switch to ${selection.provider}; keeping ${ctx.model.provider}.`,
 								"warning",
 							);
 						}
@@ -5037,7 +5264,7 @@ export default function multiSub(pi: ExtensionAPI) {
 	// Listen for user input to track last prompt
 	pi.on("before_agent_start", async (event, ctx) => {
 		lastUserPrompt = event.prompt;
-		poolManager.startTurn(event.prompt, ctx.model);
+		poolManager.startTurn(ctx.model);
 	});
 
 	// Listen for errors to trigger pool rotation

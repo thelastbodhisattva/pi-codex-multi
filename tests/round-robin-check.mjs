@@ -11,8 +11,16 @@ assert.match(inputHandler, /event\.source !== "extension"/);
 assert.match(inputHandler, /getPoolForProvider\(ctx\.model\.provider\)/);
 assert.match(inputHandler, /\(pool\.strategy \|\| "round-robin"\) === "round-robin"/);
 assert.match(inputHandler, /getNextMember\(\s*pool,\s*ctx\.model\.provider,\s*getAuthStorage\(ctx\),?\s*\)/);
-assert.match(inputHandler, /ctx\.modelRegistry\.find\(nextProvider, ctx\.model\.id\)/);
+assert.match(inputHandler, /ctx\.modelRegistry\.find\(selection\.provider, ctx\.model\.id\)/);
 assert.match(inputHandler, /await pi\.setModel\(nextModel/);
+assert.match(inputHandler, /commitRoundRobin\(pool\.name, selection\.index\)/,
+  "round-robin pointer may only advance after a confirmed switch");
+assert.ok(
+  inputHandler.indexOf("commitRoundRobin") > inputHandler.indexOf("await pi.setModel"),
+  "pointer commit must happen after the switch attempt",
+);
+assert.doesNotMatch(getNextMember, /state\.currentIndex\s*=/,
+  "getNextMember must not pre-advance the round-robin pointer");
 assert.ok(
   inputHandler.indexOf("enforceProjectRestriction") < inputHandler.indexOf("getNextMember"),
   "rotation must follow project restriction enforcement",
