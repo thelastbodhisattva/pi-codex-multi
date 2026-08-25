@@ -26,7 +26,7 @@ pi install git:github.com/thelastbodhisattva/pi-codex-multi
 - Project-level allow-lists and pool/chain overrides
 - Retry progress preserved across failover attempts
 - Failover cascade tries every eligible candidate before giving up (bounded
-  by the optional `maxRetries` setting, default 99; previously the bound was
+  by the optional `maxRetries` setting, default 3; previously the bound was
   the implicit pool size)
 - Transient provider overload ("overloaded"/"capacity"/5xx) rotates once
   without marking the account exhausted; only genuine per-account limits
@@ -86,12 +86,12 @@ Project overrides: `.pi/multi-pass.json`
       ]
     }
   ],
-  "maxRetries": 99
+  "maxRetries": 3
 }
 ```
 
 `maxRetries` bounds how many failover switch attempts one cascade may make
-across pool members and chain entries (default 99).
+across pool members and chain entries (default 3).
 
 Restrict a project to exact Codex accounts:
 

@@ -1103,7 +1103,7 @@ function emptyMultiPassConfig(): MultiPassConfig {
 
 /** Default bound on extension-driven failover attempts per cascade.
  *  Before this knob existed the bound was the implicit pool size. */
-const DEFAULT_MAX_RETRIES = 99;
+const DEFAULT_MAX_RETRIES = 3;
 
 function isCodexProviderName(value: unknown): value is string {
 	return typeof value === "string" && (value === "openai-codex" || /^openai-codex-\d+$/.test(value));

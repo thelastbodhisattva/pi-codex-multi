@@ -55,7 +55,7 @@ assert.match(handleErrorBody, /if \(!isTransientOverloadError\(errorMessage\)\)/
 assert.doesNotMatch(handleErrorBody, /cascade exhausted; no later eligible target/,
 	"a failed candidate must continue to the next one instead of declaring exhaustion");
 
-assert.match(source, /const DEFAULT_MAX_RETRIES = 99;/);
+assert.match(source, /const DEFAULT_MAX_RETRIES = 3;/);
 assert.match(source, /maxRetries:\s*\n?\s*typeof parsed\.maxRetries === "number"/,
 	"normalizeMultiPassConfig must normalize maxRetries");
 
