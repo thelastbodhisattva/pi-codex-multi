@@ -143,6 +143,10 @@ const SUPPORTED_PROVIDERS = Object.keys(PROVIDER_TEMPLATES);
 // ==========================================================================
 
 const DEFAULT_CODEX_USAGE_BASE_URL = "https://chatgpt.com/backend-api";
+// ChatGPT Codex OAuth quota endpoint; Free accounts use this route too.
+const CODEX_USAGE_PATH = "/wham/usage";
+const CODEX_MONTHLY_WINDOW_MIN_SECONDS = 28 * 24 * 60 * 60;
+const CODEX_DAY_SECONDS = 24 * 60 * 60;
 const OPENAI_AUTH_CLAIM = "https://api.openai.com/auth";
 const OPENAI_PROFILE_CLAIM = "https://api.openai.com/profile";
 
@@ -192,6 +196,7 @@ interface CodexUsageSnapshot {
 	email: string;
 	fiveHour?: CodexUsageWindow;
 	weekly?: CodexUsageWindow;
+	monthly?: CodexUsageWindow;
 }
 
 function decodeJwtPayload(token: string): Record<string, unknown> {
@@ -228,7 +233,11 @@ function normalizeCodexUsageWindow(window: unknown): CodexUsageWindow | undefine
 	if (!raw) return undefined;
 	const usedPercent = typeof raw.used_percent === "number" ? raw.used_percent : 0;
 	const windowSeconds = typeof raw.limit_window_seconds === "number" ? raw.limit_window_seconds : 0;
-	const resetAt = typeof raw.reset_at === "number" ? raw.reset_at : undefined;
+	const resetAt = typeof raw.reset_at === "number" && raw.reset_at > 0
+		? raw.reset_at
+		: typeof raw.reset_after_seconds === "number" && raw.reset_after_seconds >= 0
+			? Math.floor(Date.now() / 1000) + raw.reset_after_seconds
+			: undefined;
 	return {
 		usedPercent,
 		windowSeconds,
@@ -250,11 +259,14 @@ function parseCodexUsageSnapshot(data: unknown): CodexUsageSnapshot {
 	].filter((window): window is CodexUsageWindow => Boolean(window));
 	const fiveHour = windows.find((window) => matchesUsageWindow(window, 5 * 60 * 60));
 	const weekly = windows.find((window) => matchesUsageWindow(window, 7 * 24 * 60 * 60));
+	// Free accounts can expose a 30-day window instead of the paid 5h/7d pair.
+	const monthly = windows.find((window) => window.windowSeconds >= CODEX_MONTHLY_WINDOW_MIN_SECONDS);
 	return {
 		planType: typeof raw?.plan_type === "string" ? raw.plan_type : "unknown",
 		email: typeof raw?.email === "string" ? raw.email : "",
 		fiveHour,
 		weekly,
+		monthly,
 	};
 }
 
@@ -292,6 +304,16 @@ function formatResetLong(resetAt?: number): string {
 function formatRemainingPercent(value: number | undefined): string {
 	if (value === undefined) return "--";
 	return `${Math.round(value)}%`;
+}
+
+function formatCodexWindowLabel(window: CodexUsageWindow | undefined, fallback: string): string {
+	if (!window || window.windowSeconds < CODEX_MONTHLY_WINDOW_MIN_SECONDS) return fallback;
+	return `${Math.round(window.windowSeconds / CODEX_DAY_SECONDS)}d`;
+}
+
+function formatQuotaWindowSummary(label: string, window: CodexUsageWindow | undefined): string | undefined {
+	if (!window) return undefined;
+	return `${label} ${formatRemainingPercent(getCodexWindowRemaining(window))} (${formatResetShort(window.resetAt)})`;
 }
 
 function isAbortError(error: unknown): boolean {
@@ -332,7 +354,8 @@ function classifyCodexQuotaKind(snapshot: CodexUsageSnapshot): {
 } {
 	const fiveHourLeft = getCodexWindowRemaining(snapshot.fiveHour);
 	const weeklyLeft = getCodexWindowRemaining(snapshot.weekly);
-	const values = [fiveHourLeft, weeklyLeft].filter((value): value is number => value !== undefined);
+	const monthlyLeft = getCodexWindowRemaining(snapshot.monthly);
+	const values = [fiveHourLeft, weeklyLeft, monthlyLeft].filter((value): value is number => value !== undefined);
 	if (values.length === 0) {
 		return { kind: "error", score: 0 };
 	}
@@ -679,10 +702,22 @@ function normalizeQuotaAllowedProviderNames(cwd: string): string[] | undefined {
 	return normalized.length > 0 ? normalized : undefined;
 }
 
+function listStoredCodexProviderNames(): string[] {
+	try {
+		const data = JSON.parse(readFileSync(join(getAgentDir(), "auth.json"), "utf-8")) as Record<string, unknown>;
+		return Object.entries(data)
+			.filter(([providerName, credential]) => isCodexProviderName(providerName) && getRecord(credential)?.type === "oauth")
+			.map(([providerName]) => providerName);
+	} catch {
+		return [];
+	}
+}
+
 function collectQuotaAccounts(ctx: ExtensionContext): QuotaAccount[] {
 	const config = loadGlobalConfig();
 	const envEntries = parseEnvConfig();
 	const allSubs = normalizeEntries(mergeConfigs(config, envEntries));
+	const storedCodexProviderNames = listStoredCodexProviderNames();
 	const allowedProviderNames = normalizeQuotaAllowedProviderNames(ctx.cwd);
 	const allowed = allowedProviderNames ? new Set(allowedProviderNames) : undefined;
 	const seen = new Set<string>();
@@ -700,7 +735,7 @@ function collectQuotaAccounts(ctx: ExtensionContext): QuotaAccount[] {
 	};
 
 	for (const checker of PROVIDER_QUOTA_CHECKERS) {
-		if (getAuthStorage(ctx).hasAuth(checker.baseProvider)) {
+		if (getAuthStorage(ctx).get(checker.baseProvider)) {
 			pushAccount(
 				checker.baseProvider,
 				PROVIDER_TEMPLATES[checker.baseProvider]?.displayName || checker.baseProvider,
@@ -709,6 +744,10 @@ function collectQuotaAccounts(ctx: ExtensionContext): QuotaAccount[] {
 		for (const entry of allSubs) {
 			if (entry.provider !== checker.baseProvider) continue;
 			pushAccount(subProviderName(entry), subDisplayName(entry));
+		}
+		for (const providerName of storedCodexProviderNames) {
+			if (getBaseProvider(providerName) !== checker.baseProvider) continue;
+			pushAccount(providerName, getProviderDisplayName(providerName, allSubs));
 		}
 	}
 
@@ -738,7 +777,11 @@ const codexQuotaChecker: ProviderQuotaChecker = {
 		const accountId = typeof auth.accountId === "string" && auth.accountId.length > 0
 			? auth.accountId
 			: tokenMetadata.accountId;
-		const baseUrl = (process.env.CHATGPT_BASE_URL || DEFAULT_CODEX_USAGE_BASE_URL).replace(/\/+$/, "");
+		let baseUrl = (process.env.CHATGPT_BASE_URL || DEFAULT_CODEX_USAGE_BASE_URL).replace(/\/+$/, "");
+		if (/^https:\/\/(?:chatgpt\.com|chat\.openai\.com)$/i.test(baseUrl)) {
+			baseUrl += "/backend-api";
+		}
+		const usageUrl = `${baseUrl}${CODEX_USAGE_PATH}`;
 		const headers = new Headers({
 			Authorization: `Bearer ${auth.access}`,
 			Accept: "application/json",
@@ -749,7 +792,7 @@ const codexQuotaChecker: ProviderQuotaChecker = {
 		}
 
 		try {
-			const response = await fetch(`${baseUrl}/wham/usage`, {
+			const response = await fetch(usageUrl, {
 				method: "GET",
 				headers,
 				signal,
@@ -777,18 +820,20 @@ const codexQuotaChecker: ProviderQuotaChecker = {
 			}
 			const fiveHourLeft = getCodexWindowRemaining(snapshot.fiveHour);
 			const weeklyLeft = getCodexWindowRemaining(snapshot.weekly);
+			const monthlyLeft = getCodexWindowRemaining(snapshot.monthly);
 			// Earliest future window reset = when this account can serve again.
-			const futureResets = [snapshot.fiveHour?.resetAt, snapshot.weekly?.resetAt].filter(
+			const futureResets = [snapshot.fiveHour?.resetAt, snapshot.weekly?.resetAt, snapshot.monthly?.resetAt].filter(
 				(reset): reset is number => typeof reset === "number" && reset * 1000 > Date.now(),
 			);
 			const nextResetAt = futureResets.length > 0 ? Math.min(...futureResets) : undefined;
 			const classification = classifyCodexQuotaKind(snapshot);
 			const summary = [
 				snapshot.planType !== "unknown" ? snapshot.planType : "plan unknown",
-				`5h ${formatRemainingPercent(fiveHourLeft)} (${formatResetShort(snapshot.fiveHour?.resetAt)})`,
-				`7d ${formatRemainingPercent(weeklyLeft)} (${formatResetShort(snapshot.weekly?.resetAt)})`,
+				formatQuotaWindowSummary("5h", snapshot.fiveHour),
+				formatQuotaWindowSummary("7d", snapshot.weekly),
+				formatQuotaWindowSummary(formatCodexWindowLabel(snapshot.monthly, "30d"), snapshot.monthly),
 				formatQuotaKind(classification.kind),
-			].join(" | ");
+			].filter((value): value is string => Boolean(value)).join(" | ");
 			const details = [
 				`account: ${account.displayName}`,
 				`provider: ${account.providerName}`,
@@ -798,11 +843,23 @@ const codexQuotaChecker: ProviderQuotaChecker = {
 			if (snapshot.email) {
 				details.push(`email: ${snapshot.email}`);
 			}
-			details.push(
-				`5-hour window: ${formatRemainingPercent(fiveHourLeft)} left, resets ${formatResetLong(snapshot.fiveHour?.resetAt)}`,
-				`7-day window: ${formatRemainingPercent(weeklyLeft)} left, resets ${formatResetLong(snapshot.weekly?.resetAt)}`,
-				`endpoint: ${baseUrl}/wham/usage`,
-			);
+			if (snapshot.fiveHour) {
+				details.push(
+					`5-hour window: ${formatRemainingPercent(fiveHourLeft)} left, resets ${formatResetLong(snapshot.fiveHour.resetAt)}`,
+				);
+			}
+			if (snapshot.weekly) {
+				details.push(
+					`7-day window: ${formatRemainingPercent(weeklyLeft)} left, resets ${formatResetLong(snapshot.weekly.resetAt)}`,
+				);
+			}
+			if (snapshot.monthly) {
+				const label = formatCodexWindowLabel(snapshot.monthly, "30d").replace(/d$/, "-day");
+				details.push(
+					`${label} window: ${formatRemainingPercent(monthlyLeft)} left, resets ${formatResetLong(snapshot.monthly.resetAt)}`,
+				);
+			}
+			details.push(`endpoint: ${usageUrl}`);
 			return {
 				account,
 				kind: classification.kind,

@@ -50,7 +50,17 @@ function normalizeQuotaAllowedProviderNames(projectConfig) {
   return normalized.length > 0 ? normalized : undefined;
 }
 
-function collectQuotaProviderNames({ checkers, subscriptions, hasAuth, allowedProviderNames }) {
+function isCodexProviderName(value) {
+  return typeof value === "string" && (value === "openai-codex" || /^openai-codex-\d+$/.test(value));
+}
+
+function getBaseProvider(providerName) {
+  if (providerName === "openai-codex") return providerName;
+  const match = providerName.match(/^(.+)-(\d+)$/);
+  return match?.[1] === "openai-codex" ? match[1] : undefined;
+}
+
+function collectQuotaProviderNames({ checkers, subscriptions, hasAuth, storedProviderNames = [], allowedProviderNames }) {
   const allSubs = normalizeEntries(mergeConfigs({ subscriptions }, []));
   const allowed = allowedProviderNames ? new Set(allowedProviderNames) : undefined;
   const seen = new Set();
@@ -70,6 +80,10 @@ function collectQuotaProviderNames({ checkers, subscriptions, hasAuth, allowedPr
     for (const entry of allSubs) {
       if (entry.provider !== checker.baseProvider) continue;
       push(subProviderName(entry));
+    }
+    for (const providerName of storedProviderNames) {
+      if (!isCodexProviderName(providerName) || getBaseProvider(providerName) !== checker.baseProvider) continue;
+      push(providerName);
     }
   }
 
@@ -109,7 +123,33 @@ function runUnrestrictedCheck() {
   assert.deepEqual(providerNames, ["openai-codex", "openai-codex-2"]);
 }
 
+function runStoredAccountCheck() {
+  const providerNames = collectQuotaProviderNames({
+    checkers: [{ baseProvider: "openai-codex" }],
+    subscriptions: [],
+    hasAuth: () => false,
+    storedProviderNames: ["openai-codex-7", "openai-codex-7", "openai-codex-not-codex"],
+    allowedProviderNames: undefined,
+  });
+
+  assert.deepEqual(providerNames, ["openai-codex-7"]);
+}
+
+function runStoredAccountRestrictionCheck() {
+  const providerNames = collectQuotaProviderNames({
+    checkers: [{ baseProvider: "openai-codex" }],
+    subscriptions: [],
+    hasAuth: () => false,
+    storedProviderNames: ["openai-codex-7"],
+    allowedProviderNames: normalizeQuotaAllowedProviderNames({ allowedSubs: ["openai-codex-2"] }),
+  });
+
+  assert.deepEqual(providerNames, []);
+}
+
 runRestrictedExtraSubscriptionCheck();
 runRestrictedBaseProviderCheck();
 runUnrestrictedCheck();
+runStoredAccountCheck();
+runStoredAccountRestrictionCheck();
 console.log("project-aware limits checks passed");

@@ -117,7 +117,7 @@ export MULTI_SUB="openai-codex:2"
 
 ## Codex quota support
 
-`/subs limits` reads ChatGPT/Codex usage from `https://chatgpt.com/backend-api/wham/usage` (or `CHATGPT_BASE_URL`) and reports the five-hour and seven-day subscription windows for each logged-in Codex account.
+`/subs limits` reads ChatGPT/Codex usage from `https://chatgpt.com/backend-api/wham/usage` (or `CHATGPT_BASE_URL`) and reports the five-hour and seven-day windows for paid accounts and the provider-reported monthly window for Free accounts. It includes stored OAuth Codex accounts even when they are not listed in `multi-pass.json`; project `allowedSubs` restrictions still apply.
 
 ## License
 
