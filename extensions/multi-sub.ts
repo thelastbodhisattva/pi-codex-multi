@@ -107,6 +107,25 @@ function getCodexModels(): Model<Api>[] {
 	return [...openaiCodexProvider.getModels()] as Model<Api>[];
 }
 
+/** Resolve a model only when it is usable in this session. Pi documents an
+ * empty scopedModels list as unrestricted; otherwise provider + model ID must
+ * be present in the session's --models/enabledModels-derived scope. */
+function findUsableModel(
+	ctx: Pick<ExtensionContext, "modelRegistry"> & { scopedModels?: ExtensionContext["scopedModels"] },
+	providerName: string,
+	modelId: string,
+): Model<Api> | undefined {
+	const model = ctx.modelRegistry.find(providerName, modelId);
+	if (!model) return undefined;
+	const scopedModels = ctx.scopedModels ?? [];
+	if (scopedModels.length === 0) return model as Model<Api>;
+	return scopedModels.some(
+		(scoped) => scoped.model.provider === providerName && scoped.model.id === modelId,
+	)
+		? model as Model<Api>
+		: undefined;
+}
+
 type RegisteredProviderConfig = Parameters<ExtensionAPI["registerProvider"]>[1];
 type LegacyOAuthProvider = NonNullable<RegisteredProviderConfig["oauth"]>;
 
@@ -591,7 +610,11 @@ async function runQuotaChecks(
 	// wham/usage within seconds; reuse fresh results instead of re-fetching.
 	const results = await Promise.all(accounts.map(async (account) => {
 		const cached = quotaResultCache.get(account.providerName);
-		if (cached && cached.expires > Date.now()) return cached.result;
+		const now = Date.now();
+		const blockedResetPassed = cached?.result.kind === "blocked"
+			&& typeof cached.result.resetAt === "number"
+			&& cached.result.resetAt * 1000 <= now;
+		if (cached && cached.expires > now && !blockedResetPassed) return cached.result;
 		const checker = PROVIDER_QUOTA_CHECKERS.find(
 			(candidate) => candidate.baseProvider === account.baseProvider,
 		);
@@ -607,10 +630,12 @@ async function runQuotaChecks(
 }
 
 /** Latest future reset timestamp (epoch seconds) known for a provider from a
- *  recent quota check, or undefined. Used to size exhaustion cooldowns. */
+ *  recent quota check, or undefined. The result cache is deliberately bounded
+ *  for selection, but reset metadata remains useful for durable cooldowns even
+ *  after that short cache entry expires. */
 function getCachedQuotaResetAt(providerName: string): number | undefined {
 	const cached = quotaResultCache.get(providerName);
-	if (!cached || cached.expires <= Date.now()) return undefined;
+	if (!cached) return undefined;
 	const resetAt = cached.result.resetAt;
 	return typeof resetAt === "number" && resetAt * 1000 > Date.now() ? resetAt : undefined;
 }
@@ -777,12 +802,24 @@ const codexQuotaChecker: ProviderQuotaChecker = {
 			}
 			const fiveHourLeft = getCodexWindowRemaining(snapshot.fiveHour);
 			const weeklyLeft = getCodexWindowRemaining(snapshot.weekly);
-			// Earliest future window reset = when this account can serve again.
+			const classification = classifyCodexQuotaKind(snapshot);
 			const futureResets = [snapshot.fiveHour?.resetAt, snapshot.weekly?.resetAt].filter(
 				(reset): reset is number => typeof reset === "number" && reset * 1000 > Date.now(),
 			);
-			const nextResetAt = futureResets.length > 0 ? Math.min(...futureResets) : undefined;
-			const classification = classifyCodexQuotaKind(snapshot);
+			const blockedWindowResets = [
+				fiveHourLeft !== undefined && fiveHourLeft <= 5 ? snapshot.fiveHour?.resetAt : undefined,
+				weeklyLeft !== undefined && weeklyLeft <= 5 ? snapshot.weekly?.resetAt : undefined,
+			].filter(
+				(reset): reset is number => typeof reset === "number" && reset * 1000 > Date.now(),
+			);
+			// A blocked account becomes policy-eligible only after every blocking
+			// window resets. For non-blocked runtime cooldown sizing, retain the
+			// earliest known reset as before.
+			const nextResetAt = classification.kind === "blocked" && blockedWindowResets.length > 0
+				? Math.max(...blockedWindowResets)
+				: futureResets.length > 0
+					? Math.min(...futureResets)
+					: undefined;
 			const summary = [
 				snapshot.planType !== "unknown" ? snapshot.planType : "plan unknown",
 				`5h ${formatRemainingPercent(fiveHourLeft)} (${formatResetShort(snapshot.fiveHour?.resetAt)})`,
@@ -890,6 +927,9 @@ interface SubEntry {
 
 /** Pool member selection strategy.
  *  - "round-robin": rotate sequentially through members (default).
+ *  - "priority": prefer the first ordered member that supports the active
+ *    model and is quota-eligible; fail back on a later external turn after
+ *    its persisted cooldown/reset expires.
  *  - "quota-first": query built-in quota checkers and prefer the member
  *    with the most remaining quota. Falls back to round-robin when no
  *    quota data is available.
@@ -897,7 +937,7 @@ interface SubEntry {
  *    member. Preferred members in their active window go first (shortest
  *    remaining window first), then default members, then overflow.
  *  - "custom": delegate selection to a user-provided JS script. */
-type PoolStrategy = "round-robin" | "quota-first" | "scheduled" | "custom";
+type PoolStrategy = "round-robin" | "priority" | "quota-first" | "scheduled" | "custom";
 
 type DayOfWeek = "mon" | "tue" | "wed" | "thu" | "fri" | "sat" | "sun";
 const ALL_DAYS: readonly DayOfWeek[] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"] as const;
@@ -1110,7 +1150,7 @@ function isCodexProviderName(value: unknown): value is string {
 }
 
 function isPoolStrategy(value: unknown): value is PoolStrategy {
-	return value === "round-robin" || value === "quota-first" || value === "scheduled" || value === "custom";
+	return value === "round-robin" || value === "priority" || value === "quota-first" || value === "scheduled" || value === "custom";
 }
 
 function normalizePools(pools: unknown): PoolConfig[] {
@@ -1872,6 +1912,7 @@ class PoolManager {
 	): FailoverPlan {
 		const attemptedProviders = options?.attemptedProviders ?? new Set<string>();
 		const visitedChainIndexes = options?.visitedChainIndexes ?? new Set<number>();
+		const isModelUsable = options?.isModelUsable;
 		const pool = this.getPoolForProvider(currentModel.provider);
 		if (!pool) {
 			return { candidates: [], skips: [] };
@@ -1894,6 +1935,15 @@ class PoolManager {
 					poolName: pool.name,
 					reason: "already-attempted",
 					detail: `${candidate} skipped (already attempted this turn)`,
+				});
+				continue;
+			}
+			if (isModelUsable && !isModelUsable(candidate, currentModel.id)) {
+				skips.push({
+					type: "pool-member",
+					poolName: pool.name,
+					reason: "unavailable-model",
+					detail: `${candidate} skipped (${currentModel.id} is not supported by this provider)`,
 				});
 				continue;
 			}
@@ -1963,6 +2013,17 @@ class PoolManager {
 					});
 					continue;
 				}
+				if (isModelUsable && !isModelUsable(member, entry.model)) {
+					skips.push({
+						type: "pool-member",
+						poolName: targetPool.name,
+						reason: "unavailable-model",
+						detail: `${member} skipped (${entry.model} is not supported by this provider)`,
+						chainName: applicable.chain.name,
+						chainIndex,
+					});
+					continue;
+				}
 				const memberSkip = classifyPoolMemberSkip(
 					targetPool.name,
 					member,
@@ -2016,6 +2077,21 @@ class PoolManager {
 		if (!poolName) return;
 		const state = this.getOrCreatePoolState(poolName);
 		state.exhausted.set(providerName, Date.now() + clampExhaustedMs(cooldownMs));
+		this.persistExhaustedState();
+	}
+
+	/** Persist a quota snapshot's exact reset boundary. Unlike runtime error
+	 *  cooldowns this is not capped at 30 minutes: a positively blocked account
+	 *  should stay out of priority routing until the service says it resets. */
+	markQuotaBlocked(providerName: string, resetAt?: number): void {
+		const poolName = this.providerToPool.get(providerName);
+		if (!poolName) return;
+		const now = Date.now();
+		const resetMs = typeof resetAt === "number" ? resetAt * 1000 : Number.NaN;
+		const until = Number.isFinite(resetMs) && resetMs > now
+			? resetMs
+			: now + DEFAULT_EXHAUSTED_MS;
+		this.getOrCreatePoolState(poolName).exhausted.set(providerName, until);
 		this.persistExhaustedState();
 	}
 
@@ -2139,6 +2215,56 @@ class PoolManager {
 		}
 	}
 
+	/** Select a proactive target for an ordered priority pool.
+	 *
+	 * Only the highest-priority structurally eligible member is probed. A
+	 * positive ready/watch/low result permits promotion, a blocked result is
+	 * persisted through its reset and permits fallback, and an unavailable
+	 * lookup keeps the current model (fail-safe). Once a preferred member is
+	 * cooling down, later external turns do not make another request until the
+	 * persisted boundary expires. */
+	async getPriorityTarget(
+		pool: PoolConfig,
+		currentModel: Model<Api>,
+		ctx: ExtensionContext,
+	): Promise<string | undefined> {
+		const authStorage = getAuthStorage(ctx);
+		const candidates = this.getAvailableMembers(pool, authStorage).filter(
+			(provider) => Boolean(findUsableModel(ctx, provider, currentModel.id)),
+		);
+		const first = candidates[0];
+		if (!first) return undefined;
+
+		// If all higher-priority entries are structurally unavailable or cooling
+		// down, the current provider is already the correct stable fallback.
+		if (first === currentModel.provider && pool.members[0] !== first) {
+			return undefined;
+		}
+
+		const account: QuotaAccount = {
+			providerName: first,
+			baseProvider: getBaseProvider(first) || first,
+			displayName: first,
+			auth: authStorage.get(first) as AuthStorageEntry | undefined,
+		};
+		let result: QuotaCheckResult | undefined;
+		try {
+			[result] = await runQuotaChecks([account]);
+		} catch {
+			return undefined;
+		}
+		if (!result || result.kind === "error" || result.kind === "missing-auth") {
+			return undefined;
+		}
+		if (result.kind !== "blocked") {
+			return first === currentModel.provider ? undefined : first;
+		}
+
+		this.markQuotaBlocked(first, result.resetAt);
+		const fallback = candidates.find((provider) => provider !== first);
+		return fallback && fallback !== currentModel.provider ? fallback : undefined;
+	}
+
 	/**
 	 * Reorder failover plan candidates based on the pool's strategy.
 	 * Mutates plan.candidates in place.
@@ -2157,6 +2283,20 @@ class PoolManager {
 		const poolCandidates = plan.candidates.filter(
 			(c) => c.source === "pool" && c.poolName === pool.name,
 		);
+
+		if (strategy === "priority") {
+			const priority = new Map(pool.members.map((provider, index) => [provider, index]));
+			const ordered = [...poolCandidates].sort(
+				(left, right) => (priority.get(left.provider) ?? Number.MAX_SAFE_INTEGER)
+					- (priority.get(right.provider) ?? Number.MAX_SAFE_INTEGER),
+			);
+			const remainder = plan.candidates.filter(
+				(candidate) => candidate.source !== "pool" || candidate.poolName !== pool.name,
+			);
+			plan.candidates = [...ordered, ...remainder];
+			return;
+		}
+
 		if (poolCandidates.length < 2 && strategy !== "custom") return;
 
 		if (strategy === "quota-first") {
@@ -2321,6 +2461,7 @@ class PoolManager {
 			{
 				attemptedProviders: cascade.attemptedProviders,
 				visitedChainIndexes: cascade.visitedChainIndexes,
+				isModelUsable: (provider, modelId) => Boolean(findUsableModel(ctx, provider, modelId)),
 			},
 		);
 
@@ -2356,7 +2497,7 @@ class PoolManager {
 				break;
 			}
 
-			const nextModel = ctx.modelRegistry.find(nextCandidate.provider, nextCandidate.modelId);
+			const nextModel = findUsableModel(ctx, nextCandidate.provider, nextCandidate.modelId);
 			if (!nextModel) {
 				ctx.ui.notify(
 					`[pool:${nextCandidate.poolName}] ${nextCandidate.provider} -> ${nextCandidate.modelId} skipped (model missing at runtime); trying next candidate`,
@@ -3392,13 +3533,15 @@ async function promptForPoolDefinition(
 	// Ask for selection strategy
 	const strategyItems = [
 		"round-robin -- Rotate members sequentially (default)",
+		"priority -- Prefer members in order while quota-eligible",
 		"quota-first -- Prefer the member with the most remaining quota",
 		"scheduled -- Use per-member time windows and priority roles",
 		"custom -- Delegate to a JS selector script",
 	];
 	const strategyPick = await ctx.ui.select("Selection strategy", strategyItems);
 	let strategy: PoolStrategy = "round-robin";
-	if (strategyPick?.startsWith("quota-first")) strategy = "quota-first";
+	if (strategyPick?.startsWith("priority")) strategy = "priority";
+	else if (strategyPick?.startsWith("quota-first")) strategy = "quota-first";
 	else if (strategyPick?.startsWith("scheduled")) strategy = "scheduled";
 	else if (strategyPick?.startsWith("custom")) strategy = "custom";
 
@@ -3622,6 +3765,11 @@ async function changePoolStrategy(
 			description: "Rotate members sequentially (default)",
 		},
 		{
+			value: "priority",
+			label: "priority",
+			description: "Prefer members in configured order while quota-eligible",
+		},
+		{
 			value: "quota-first",
 			label: "quota-first",
 			description: "Prefer the member with the most remaining quota",
@@ -3708,7 +3856,7 @@ async function changePoolStrategy(
 		pool.selectorScript = scriptPath.trim();
 		selectorCache.delete(resolveSelectorScriptPath(pool.selectorScript));
 		delete pool.memberSchedule;
-	} else if (nextStrategy === "quota-first") {
+	} else if (nextStrategy === "quota-first" || nextStrategy === "priority") {
 		delete pool.memberSchedule;
 		delete pool.selectorScript;
 	}
@@ -4071,6 +4219,7 @@ interface FailoverSkip {
 interface FailoverPlanOptions {
 	attemptedProviders?: Set<string>;
 	visitedChainIndexes?: Set<number>;
+	isModelUsable?: (provider: string, modelId: string) => boolean;
 }
 
 interface FailoverPlan {
@@ -5223,7 +5372,7 @@ export default function multiSub(pi: ExtensionAPI) {
 					getAuthStorage(ctx),
 				);
 				if (selection) {
-					const nextModel = ctx.modelRegistry.find(selection.provider, ctx.model.id);
+					const nextModel = findUsableModel(ctx, selection.provider, ctx.model.id);
 					if (!nextModel) {
 						ctx.ui.notify(
 							`multi-pass: ${selection.provider} lacks ${ctx.model.id}; keeping ${ctx.model.provider}.`,
@@ -5247,6 +5396,27 @@ export default function multiSub(pi: ExtensionAPI) {
 						} catch {
 							ctx.ui.notify(
 								`multi-pass: could not switch to ${selection.provider}; keeping ${ctx.model.provider}.`,
+								"warning",
+							);
+						}
+					}
+				}
+			} else if (pool?.enabled && pool.strategy === "priority") {
+				const activeModel = ctx.model;
+				const targetProvider = await poolManager.getPriorityTarget(pool, activeModel, ctx);
+				if (targetProvider) {
+					const nextModel = findUsableModel(ctx, targetProvider, activeModel.id);
+					if (nextModel) {
+						const switched = await safeSetModel(pi, nextModel as Model<Api>);
+						if (switched) {
+							ctx.ui.setStatus("multi-pass", `priority: ${targetProvider}`);
+							ctx.ui.notify(
+								`[pool:${pool.name}] priority: ${activeModel.provider} -> ${targetProvider} (${activeModel.id})`,
+								"info",
+							);
+						} else {
+							ctx.ui.notify(
+								`multi-pass: could not switch to priority target ${targetProvider}; keeping ${activeModel.provider}.`,
 								"warning",
 							);
 						}
