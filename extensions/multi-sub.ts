@@ -211,6 +211,14 @@ interface CodexUsageSnapshot {
 	email: string;
 	fiveHour?: CodexUsageWindow;
 	weekly?: CodexUsageWindow;
+	/** True when purchased credits can fund requests past the plan windows:
+	 *  `credits.has_credits` (or `unlimited`) without `overage_limit_reached`
+	 *  and without `spend_control.reached`. Codex keeps serving such an
+	 *  account after its plan window is spent, so it must not be treated as
+	 *  blocked. */
+	creditOverage: boolean;
+	/** Reported credit balance, for display only. */
+	creditBalance?: string;
 }
 
 function decodeJwtPayload(token: string): Record<string, unknown> {
@@ -269,11 +277,31 @@ function parseCodexUsageSnapshot(data: unknown): CodexUsageSnapshot {
 	].filter((window): window is CodexUsageWindow => Boolean(window));
 	const fiveHour = windows.find((window) => matchesUsageWindow(window, 5 * 60 * 60));
 	const weekly = windows.find((window) => matchesUsageWindow(window, 7 * 24 * 60 * 60));
+	const credits = getRecord(raw?.credits);
+	const spendControl = getRecord(raw?.spend_control);
+	const planLimitReached = rateLimit?.limit_reached === true;
+	const hasCredits = credits?.has_credits === true || credits?.unlimited === true;
+	// Credits answer "plan allowance spent", not arbitrary request denials.
+	// Only override an explicit plan-limit verdict; live request 429s remain
+	// authoritative and are handled separately by the runtime failover path.
+	const creditOverage = planLimitReached
+		&& hasCredits
+		&& credits?.overage_limit_reached !== true
+		&& spendControl?.reached !== true;
+	const creditBalance = credits?.unlimited === true
+		? "unlimited"
+		: typeof credits?.balance === "string"
+			? credits.balance
+			: typeof credits?.balance === "number"
+				? String(credits.balance)
+				: undefined;
 	return {
 		planType: typeof raw?.plan_type === "string" ? raw.plan_type : "unknown",
 		email: typeof raw?.email === "string" ? raw.email : "",
 		fiveHour,
 		weekly,
+		creditOverage,
+		creditBalance,
 	};
 }
 
@@ -356,6 +384,10 @@ function classifyCodexQuotaKind(snapshot: CodexUsageSnapshot): {
 		return { kind: "error", score: 0 };
 	}
 	const bottleneck = Math.min(...values);
+	// A spent plan window funded by credits still serves requests (the
+	// server only refuses once credits/overage/spend controls are exhausted),
+	// so report it as a warning instead of parking the account until reset.
+	if (bottleneck <= 5 && snapshot.creditOverage) return { kind: "watch", score: bottleneck };
 	if (bottleneck <= 5) return { kind: "blocked", score: bottleneck };
 	if (bottleneck <= 15) return { kind: "low", score: bottleneck };
 	if (bottleneck <= 30) return { kind: "watch", score: bottleneck };
@@ -824,6 +856,7 @@ const codexQuotaChecker: ProviderQuotaChecker = {
 				snapshot.planType !== "unknown" ? snapshot.planType : "plan unknown",
 				`5h ${formatRemainingPercent(fiveHourLeft)} (${formatResetShort(snapshot.fiveHour?.resetAt)})`,
 				`7d ${formatRemainingPercent(weeklyLeft)} (${formatResetShort(snapshot.weekly?.resetAt)})`,
+				...(snapshot.creditOverage ? [`credits ${snapshot.creditBalance ?? "available"}`] : []),
 				formatQuotaKind(classification.kind),
 			].join(" | ");
 			const details = [
