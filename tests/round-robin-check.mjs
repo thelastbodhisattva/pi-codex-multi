@@ -11,7 +11,7 @@ assert.match(inputHandler, /event\.source !== "extension"/);
 assert.match(inputHandler, /getPoolForProvider\(ctx\.model\.provider\)/);
 assert.match(inputHandler, /\(pool\.strategy \|\| "round-robin"\) === "round-robin"/);
 assert.match(inputHandler, /getNextMember\(\s*pool,\s*ctx\.model\.provider,\s*getAuthStorage\(ctx\),?\s*\)/);
-assert.match(inputHandler, /ctx\.modelRegistry\.find\(selection\.provider, ctx\.model\.id\)/);
+assert.match(inputHandler, /findUsableModel\(ctx, selection\.provider, ctx\.model\.id\)/);
 assert.match(inputHandler, /await pi\.setModel\(nextModel/);
 assert.match(inputHandler, /commitRoundRobin\(pool\.name, selection\.index\)/,
   "round-robin pointer may only advance after a confirmed switch");

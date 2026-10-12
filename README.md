@@ -20,8 +20,9 @@ pi install git:github.com/thelastbodhisattva/pi-codex-multi
 
 - Multiple `openai-codex` OAuth subscriptions (`openai-codex-2`, `openai-codex-3`, ...)
 - `/subs` account management and Codex quota snapshots
-- Rotation pools with `round-robin`, `quota-first`, `scheduled`, and `custom` strategies
+- Rotation pools with `round-robin`, `priority`, `quota-first`, `scheduled`, and `custom` strategies
 - `round-robin` switches to the next eligible account before each external user turn; extension-injected failover retries do not consume another slot.
+- `priority` prefers members in configured order while their quota is eligible, falls back on a blocked/runtime-limited member, and automatically returns after its persisted reset. Quota lookups use a bounded cache, and lookup failures keep the current provider.
 - Fallback chains and Codex-only model presets
 - Project-level allow-lists and pool/chain overrides
 - Retry progress preserved across failover attempts
@@ -72,9 +73,9 @@ Project overrides: `.pi/multi-pass.json`
     {
       "name": "codex-pool",
       "baseProvider": "openai-codex",
-      "members": ["openai-codex", "openai-codex-2"],
+      "members": ["openai-codex-2", "openai-codex"],
       "enabled": true,
-      "strategy": "round-robin"
+      "strategy": "priority"
     }
   ],
   "presets": [
@@ -113,7 +114,9 @@ export MULTI_SUB="openai-codex:2"
 
 ### Pool strategies
 
-`/pool create` asks for a strategy; existing pools expose it through their action menu. The default is **`round-robin`**. Other choices are `quota-first`, `scheduled`, and `custom`.
+`/pool create` asks for a strategy; existing pools expose it through their action menu. The default is **`round-robin`**. Other choices are `priority`, `quota-first`, `scheduled`, and `custom`.
+
+`priority` treats `members` as a preference order. On an external turn it checks the first eligible member using the cached Codex quota snapshot, promotes to it when available, or persists its reset and uses the next authenticated member when blocked. Extension-generated retry turns never trigger this proactive selection. Model capability is a hard filter: the target must exist in the registry and, when `enabledModels`/`--models` configured a non-empty session scope, its exact `provider/model` pair must appear in `ctx.scopedModels` (an empty scope means unrestricted, per Pi semantics).
 
 ## Codex quota support
 
