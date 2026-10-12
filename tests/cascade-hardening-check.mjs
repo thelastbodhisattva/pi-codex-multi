@@ -160,11 +160,20 @@ assert.equal(readdirSync(dir).filter((f) => f.endsWith(".tmp")).length, 0,
 	"the helper must clean up its temp file on failure");
 
 // A leftover .tmp from an external crash is ignored by readers: only the
-// exact state path is ever read back (loadPersistedState contract).
+// exact state path is ever read back (refreshPersistedState contract).
 fs.writeFileSync(path.join(dir, ".state.json.999999.1.tmp"), "{ truncated garbage");
 assert.deepEqual(JSON.parse(fs.readFileSync(target, "utf8")), { ok: true });
-assert.match(cut("\tloadPersistedState(): void {", "\tgetNextMember("),
-	/multiPassStatePath\(\)/, "state loading reads only the canonical state path");
+const persistedRefreshBody = cut("\tprivate refreshPersistedState(): void {", "\t/** Best-effort persistence");
+assert.match(persistedRefreshBody, /multiPassStatePath\(\)/,
+	"state refresh reads only the canonical state path");
+assert.match(persistedRefreshBody, /if \(until > existing\) state\.exhausted\.set\(provider, until\)/,
+	"cross-process state merge must preserve the longest known reset");
+assert.match(cut("\tprivate persistExhaustedState(): void {", "\t\/\*\* Load persisted"),
+	/this\.refreshPersistedState\(\)/,
+	"writers must merge peer state immediately before persisting");
+assert.match(cut("\tbuildFailoverPlan(", "\t\/\*\* Mark a member as exhausted"),
+	/this\.refreshPersistedState\(\)/,
+	"runtime failover must refresh peer exhaustion before selecting candidates");
 
 // ---------------------------------------------------------------------------
 // 6. Project config strips selectorScript (structural pins)
@@ -185,5 +194,8 @@ assert.match(source, /multi-pass\.state\.json/);
 assert.match(source, /poolManager\.loadPersistedState\(\)/,
 	"session_start must load persisted exhaustion state");
 assert.match(source, /saveExhaustedState\(pools\)/);
+assert.match(cut("\tloadPersistedState(): void {", "\tgetNextMember("),
+	/this\.refreshPersistedState\(\)/,
+	"session_start loading delegates to the same monotonic refresh path");
 
 console.log("cascade hardening checks passed");

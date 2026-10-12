@@ -1899,6 +1899,9 @@ class PoolManager {
 		pool: PoolConfig,
 		authStorage: { hasAuth(provider: string): boolean },
 	): string[] {
+		// Pool state is shared by every live Pi process. Refresh before selection
+		// so a cooldown/reset learned by one session is honored by its peers.
+		this.refreshPersistedState();
 		const state = this.getOrCreatePoolState(pool.name);
 		return pool.members.filter((member) => {
 			if (!authStorage.hasAuth(member)) return false;
@@ -1943,6 +1946,7 @@ class PoolManager {
 		authStorage: { hasAuth(provider: string): boolean },
 		options?: FailoverPlanOptions,
 	): FailoverPlan {
+		this.refreshPersistedState();
 		const attemptedProviders = options?.attemptedProviders ?? new Set<string>();
 		const visitedChainIndexes = options?.visitedChainIndexes ?? new Set<number>();
 		const isModelUsable = options?.isModelUsable;
@@ -2139,9 +2143,36 @@ class PoolManager {
 		return undefined;
 	}
 
+	/** Merge future persisted timestamps into this process. The merge is
+	 * monotonic so a short runtime cooldown cannot replace a longer quota reset
+	 * learned by another live session. */
+	private refreshPersistedState(): void {
+		try {
+			const path = multiPassStatePath();
+			if (!existsSync(path)) return;
+			const raw = JSON.parse(readFileSync(path, "utf-8")) as PersistedPoolState;
+			const now = Date.now();
+			for (const [poolName, members] of Object.entries(raw.pools ?? {})) {
+				const state = this.poolStates.get(poolName);
+				const pool = this.pools.get(poolName);
+				if (!state || !pool) continue;
+				for (const [provider, until] of Object.entries(members)) {
+					if (!pool.members.includes(provider) || typeof until !== "number" || until <= now) continue;
+					const existing = state.exhausted.get(provider) ?? 0;
+					if (until > existing) state.exhausted.set(provider, until);
+				}
+			}
+		} catch {
+			// Corrupt or leftover temp state files are ignored.
+		}
+	}
+
 	/** Best-effort persistence of exhaustion timestamps across processes. */
 	private persistExhaustedState(): void {
 		try {
+			// Merge immediately before writing to preserve longer reset boundaries
+			// published by peers instead of clobbering them with this process's map.
+			this.refreshPersistedState();
 			const pools = new Map<string, Record<string, number>>();
 			for (const [poolName, state] of this.poolStates) {
 				if (state.exhausted.size > 0) pools.set(poolName, Object.fromEntries(state.exhausted));
@@ -2154,21 +2185,7 @@ class PoolManager {
 
 	/** Load persisted exhaustion timestamps (called on session_start). */
 	loadPersistedState(): void {
-		try {
-			const path = multiPassStatePath();
-			if (!existsSync(path)) return;
-			const raw = JSON.parse(readFileSync(path, "utf-8")) as PersistedPoolState;
-			const now = Date.now();
-			for (const [poolName, members] of Object.entries(raw.pools ?? {})) {
-				const state = this.poolStates.get(poolName);
-				if (!state) continue;
-				for (const [provider, until] of Object.entries(members)) {
-					if (typeof until === "number" && until > now) state.exhausted.set(provider, until);
-				}
-			}
-		} catch {
-			// Corrupt or leftover temp state files are ignored.
-		}
+		this.refreshPersistedState();
 	}
 
 	/** Get the next available member in a pool, skipping the current one.
@@ -2323,10 +2340,37 @@ class PoolManager {
 				(left, right) => (priority.get(left.provider) ?? Number.MAX_SAFE_INTEGER)
 					- (priority.get(right.provider) ?? Number.MAX_SAFE_INTEGER),
 			);
+			const eligible: FailoverCandidate[] = [];
+			for (const candidate of ordered) {
+				const account: QuotaAccount = {
+					providerName: candidate.provider,
+					baseProvider: getBaseProvider(candidate.provider) || candidate.provider,
+					displayName: candidate.provider,
+					auth: getAuthStorage(ctx).get(candidate.provider) as AuthStorageEntry | undefined,
+				};
+				let result: QuotaCheckResult | undefined;
+				try {
+					[result] = await runQuotaChecks([account]);
+				} catch {
+					// Preserve existing runtime failover behavior when quota lookup is
+					// unavailable; only a positive blocked verdict removes a candidate.
+				}
+				if (result?.kind === "blocked") {
+					this.markQuotaBlocked(candidate.provider, result.resetAt);
+					plan.skips.push({
+						type: "pool-member",
+						poolName: pool.name,
+						reason: "exhausted",
+						detail: `${candidate.provider} skipped (quota snapshot is blocked)`,
+					});
+					continue;
+				}
+				eligible.push(candidate);
+			}
 			const remainder = plan.candidates.filter(
 				(candidate) => candidate.source !== "pool" || candidate.poolName !== pool.name,
 			);
-			plan.candidates = [...ordered, ...remainder];
+			plan.candidates = [...eligible, ...remainder];
 			return;
 		}
 

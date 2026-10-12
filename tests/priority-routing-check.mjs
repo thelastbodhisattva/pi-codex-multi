@@ -11,6 +11,10 @@ assert.match(source, /priority -- Prefer members in order while quota-eligible/)
 assert.match(source, /value: "priority"[\s\S]*?configured order while quota-eligible/);
 assert.match(source, /const QUOTA_CACHE_TTL_MS = 30 \* 1000/);
 assert.match(source, /markQuotaBlocked\(first, result\.resetAt\)/);
+assert.match(source, /this\.refreshPersistedState\(\);[\s\S]*?buildFailoverPlan/,
+  "runtime candidate planning must merge shared exhaustion state");
+assert.match(source, /if \(strategy === "priority"\)[\s\S]*?runQuotaChecks\(\[account\]\)[\s\S]*?result\?\.kind === "blocked"[\s\S]*?markQuotaBlocked\(candidate\.provider, result\.resetAt\)/,
+  "priority runtime failover must reject candidates with a blocked live quota snapshot");
 assert.match(source, /function findUsableModel\(/);
 assert.match(source, /const scopedModels = ctx\.scopedModels \?\? \[\];[\s\S]*?if \(scopedModels\.length === 0\) return model/);
 assert.match(source, /scoped\.model\.provider === providerName && scoped\.model\.id === modelId/);
@@ -98,16 +102,22 @@ class PriorityHarness {
     this.current = { provider: target, id: this.current.id };
   }
 
-  async runtimeRateLimit() {
+  async runtimeRateLimit({ transient = false } = {}) {
     const failed = this.current.provider;
-    this.exhausted.set(failed, this.now + 300_000);
-    const target = this.members.find((provider) =>
-      provider !== failed && this.structurallyEligible(provider, this.current.id));
-    if (!target) return false;
-    this.switches.push(`${target}:${this.current.id}`);
-    this.current = { provider: target, id: this.current.id };
-    this.followUps += 1;
-    return true;
+    if (!transient) this.exhausted.set(failed, this.now + 300_000);
+    for (const target of this.members) {
+      if (target === failed || !this.structurallyEligible(target, this.current.id)) continue;
+      const result = await this.lookup(target);
+      if (result?.kind === "blocked") {
+        this.exhausted.set(target, result.resetAt > this.now ? result.resetAt : this.now + 300_000);
+        continue;
+      }
+      this.switches.push(`${target}:${this.current.id}`);
+      this.current = { provider: target, id: this.current.id };
+      this.followUps += 1;
+      return true;
+    }
+    return false;
   }
 }
 
@@ -179,6 +189,27 @@ const sharedModels = new Set(members.map((provider) => `${provider}:${shared}`))
   assert.deepEqual(h.switches, []);
 }
 
+// A transient overload on the working fallback must not route into a preferred
+// account whose live quota snapshot is blocked. Persist the exact reset and
+// leave the current provider unchanged instead.
+{
+  const resetAt = 20_000;
+  const h = new PriorityHarness({
+    members,
+    authenticated: new Set(members),
+    models: sharedModels,
+    now: 5_000,
+    quota: async (provider) => provider === "openai-codex-2"
+      ? { kind: "blocked", resetAt }
+      : { kind: "ready" },
+  });
+  h.current = { provider: "openai-codex", id: shared };
+  assert.equal(await h.runtimeRateLimit({ transient: true }), false);
+  assert.equal(h.current.provider, "openai-codex");
+  assert.equal(h.exhausted.get("openai-codex-2"), resetAt);
+  assert.deepEqual(h.lookupCalls, ["openai-codex-2"]);
+}
+
 // Missing preferred auth is skipped without a lookup or switch.
 {
   const h = new PriorityHarness({
@@ -223,7 +254,8 @@ const sharedModels = new Set(members.map((provider) => `${provider}:${shared}`))
   assert.equal(h.current.provider, "openai-codex");
   assert.equal(h.followUps, 1);
   assert.deepEqual(h.switches, [`openai-codex:${shared}`]);
-  assert.deepEqual(h.lookupCalls, []);
+  assert.deepEqual(h.lookupCalls, ["openai-codex"],
+    "runtime priority failover validates the target quota once");
 }
 
 console.log("priority routing checks passed");
